@@ -10,10 +10,78 @@
 
 const std = @import("std");
 
-const c = @cImport({
-    @cInclude("decQuad.h");
-    @cInclude("decContext.h");
-});
+// Hand-written extern declarations for the decNumber decQuad subset we use.
+// Replaces @cImport so the Zig frontend never parses the C headers (faster
+// compile, and a step toward a full native port). Signatures mirror
+// vendor/decNumber/decQuad.h + decContext.h exactly.
+const c = struct {
+    // --- types ---------------------------------------------------------------
+    /// The decQuad decimal128 datum: a 16-byte union (DPD-encoded).
+    /// DECUSE64 is not defined when decQuad.h is compiled (decNumberLocal.h
+    /// is included after it), so the C union has no `longs` member — align 4.
+    pub const decQuad = extern union {
+        bytes: [16]u8,
+        shorts: [8]u16,
+        words: [4]u32,
+    };
+
+    /// The decimal context (DECSUBSET=0, so no `extended` field).
+    pub const decContext = extern struct {
+        digits: i32,
+        emax: i32,
+        emin: i32,
+        round: c_int, // enum rounding (C `int`)
+        traps: u32,
+        status: u32,
+        clamp: u8,
+    };
+
+    // --- rounding modes (enum rounding) --------------------------------------
+    pub const DEC_ROUND_CEILING: c_int = 0;
+    pub const DEC_ROUND_UP: c_int = 1;
+    pub const DEC_ROUND_HALF_UP: c_int = 2;
+    pub const DEC_ROUND_HALF_EVEN: c_int = 3;
+    pub const DEC_ROUND_HALF_DOWN: c_int = 4;
+    pub const DEC_ROUND_DOWN: c_int = 5;
+    pub const DEC_ROUND_FLOOR: c_int = 6;
+    pub const DEC_ROUND_05UP: c_int = 7;
+
+    // --- init descriptor -----------------------------------------------------
+    pub const DEC_INIT_DECQUAD: i32 = 128; // DEC_INIT_DECIMAL128
+
+    // --- decContext routines -------------------------------------------------
+    pub extern fn decContextDefault(*decContext, i32) *decContext;
+
+    // --- decQuad conversions -------------------------------------------------
+    pub extern fn decQuadFromString(*decQuad, [*c]const u8, *decContext) *decQuad;
+    pub extern fn decQuadFromInt32(*decQuad, i32) *decQuad;
+    pub extern fn decQuadFromUInt32(*decQuad, u32) *decQuad;
+    pub extern fn decQuadToString(*const decQuad, [*c]u8) [*c]u8;
+    pub extern fn decQuadToInt32(*const decQuad, *decContext, c_int) i32;
+
+    // --- decQuad arithmetic --------------------------------------------------
+    pub extern fn decQuadAdd(*decQuad, *const decQuad, *const decQuad, *decContext) *decQuad;
+    pub extern fn decQuadSubtract(*decQuad, *const decQuad, *const decQuad, *decContext) *decQuad;
+    pub extern fn decQuadMultiply(*decQuad, *const decQuad, *const decQuad, *decContext) *decQuad;
+    pub extern fn decQuadDivide(*decQuad, *const decQuad, *const decQuad, *decContext) *decQuad;
+    pub extern fn decQuadMinus(*decQuad, *const decQuad, *decContext) *decQuad;
+    pub extern fn decQuadAbs(*decQuad, *const decQuad, *decContext) *decQuad;
+    pub extern fn decQuadFMA(*decQuad, *const decQuad, *const decQuad, *const decQuad, *decContext) *decQuad;
+    pub extern fn decQuadToIntegralValue(*decQuad, *const decQuad, *decContext, c_int) *decQuad;
+    pub extern fn decQuadLogB(*decQuad, *const decQuad, *decContext) *decQuad;
+    pub extern fn decQuadScaleB(*decQuad, *const decQuad, *const decQuad, *decContext) *decQuad;
+
+    // --- decQuad comparisons -------------------------------------------------
+    pub extern fn decQuadCompare(*decQuad, *const decQuad, *const decQuad, *decContext) *decQuad;
+
+    // --- decQuad predicates --------------------------------------------------
+    pub extern fn decQuadIsNaN(*const decQuad) u32;
+    pub extern fn decQuadIsInfinite(*const decQuad) u32;
+    pub extern fn decQuadIsZero(*const decQuad) u32;
+    pub extern fn decQuadIsNegative(*const decQuad) u32;
+    pub extern fn decQuadIsFinite(*const decQuad) u32;
+    pub extern fn decQuadIsInteger(*const decQuad) u32;
+};
 
 /// The phloat type: a 34-digit decimal128 value (16 bytes).
 pub const Phloat = c.decQuad;
@@ -209,7 +277,7 @@ pub fn pow10(n: i32) Phloat {
     return r;
 }
 
-fn toIntegral(p: Phloat, rounding: c_uint) Phloat {
+fn toIntegral(p: Phloat, rounding: c_int) Phloat {
     var r: Phloat = undefined;
     _ = c.decQuadToIntegralValue(&r, &p, &ctx, rounding);
     return r;
