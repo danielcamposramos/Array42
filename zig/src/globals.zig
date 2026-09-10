@@ -160,6 +160,24 @@ pub const Flags = struct {
 pub var flags: Flags = .{};
 
 // ---------------------------------------------------------------------------
+// Core settings (matches core_settings_struct in core_main.h)
+// ---------------------------------------------------------------------------
+
+/// User-configurable core settings. The two matrix flags gate the HP-42S
+/// compatible "fudge" behaviors in the linear-algebra engine:
+///   - `matrix_singularmatrix`: when true, a zero pivot is an error; when
+///     false (default), a tiny value is substituted so the computation
+///     continues (HP-42S compatible).
+///   - `matrix_outofrange`: when true, an infinite matrix result is an error;
+///     when false (default), it is clamped to ±huge.
+pub const Settings = struct {
+    matrix_singularmatrix: bool = false,
+    matrix_outofrange: bool = false,
+};
+
+pub var settings: Settings = .{};
+
+// ---------------------------------------------------------------------------
 // Mode / entry state
 // ---------------------------------------------------------------------------
 
