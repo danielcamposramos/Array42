@@ -17,11 +17,51 @@ const helpers = @import("helpers.zig");
 const Err = globals.Err;
 const Vartype = vartype.Vartype;
 
-/// A minimal command argument. Only the numeric field is used by the commands
-/// ported so far (FIX/SCI/ENG digit counts).
-pub const Arg = struct {
-    num: i32 = 0,
+/// Command argument types (matches ARGTYPE_* in core_tables.h).
+pub const ArgType = enum(u8) {
+    none = 0,
+    num = 1,
+    neg_num = 2,
+    stk = 3,
+    str = 4,
+    ind_num = 5,
+    ind_stk = 6,
+    ind_str = 7,
+    command = 8,
+    lclbl = 9,
+    double = 10,
+    lblindex = 11,
+    xstr = 12,
 };
+
+/// A command argument (matches `arg_struct` in core_tables.h). The numeric
+/// field serves FIX/SCI/ENG; `text`/`length` carry a variable name for
+/// STO/RCL/DIM/CLV; `stk` carries a stack-level letter (X/Y/Z/T/L).
+pub const Arg = struct {
+    type: ArgType = .none,
+    num: i32 = 0,
+    text: [15]u8 = .{0} ** 15,
+    length: u16 = 0,
+    stk: u8 = 0,
+};
+
+/// Build a numeric argument (FIX/SCI/ENG/SIZE).
+pub fn numArg(n: i32) Arg {
+    return .{ .type = .num, .num = n };
+}
+
+/// Build a string (named-variable) argument.
+pub fn strArg(name: []const u8) Arg {
+    var a = Arg{ .type = .str };
+    a.length = @intCast(name.len);
+    for (name, 0..) |c, i| a.text[i] = c;
+    return a;
+}
+
+/// Build a stack-level argument (X/Y/Z/T/L).
+pub fn stkArg(c: u8) Arg {
+    return .{ .type = .stk, .stk = c };
+}
 
 fn x() *Vartype {
     return globals.stack[helpers.xIndex()].?;
