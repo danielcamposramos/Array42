@@ -25,7 +25,7 @@ tests pass.
 
 | Layer | File | Status |
 |---|---|---|
-| Decimal core | `vendor/decNumber/` (vendored C, ICU license) | done |
+| Decimal core | `src/phloat.zig` (native Zig, no C) | done |
 | Float abstraction | `src/phloat.zig` | done (transcendentals done) |
 | Calculator core | `common/*.cc` → `src/` | done (steps 2–4) |
 | Equation Writer | `src/equation.zig` | done (step 5) |
@@ -109,14 +109,15 @@ Free42's core is layered with two seams that make the port tractable:
         ↓  shell.h  (platform interface)
 [Core: common/*.cc — calculator logic, ~49k lines]
         ↓  core_phloat  (float abstraction)
-[Decimal math: Intel BID  →  we use decNumber's decQuad]
+[Decimal math: native Zig `src/phloat.zig` (34-digit decimal128)]
 ```
 
-`phloat` is a 34-digit IEEE 754 decimal128 (`decQuad`), matching Free42
-Decimal's `bid128` precision exactly. The `shell.h` seam is realized as the
-MCP server in `src/mcp.zig` — the same place a GUI frontend would plug in.
+`phloat` is a 34-digit IEEE 754 decimal128, matching Free42 Decimal's
+`bid128` precision exactly — implemented natively in Zig (no C dependency).
+The `shell.h` seam is realized as the MCP server in `src/mcp.zig` — the same
+place a GUI frontend would plug in.
 
 ## License
 
-The Zig port is GPL-2.0 (inherited from Free42). The vendored decNumber is
-under the ICU license (`vendor/decNumber/ICU-license.html`).
+The Zig port is GPL-2.0 (inherited from Free42). The decimal core is native
+Zig (`src/phloat.zig`), so there is no vendored C dependency to license.

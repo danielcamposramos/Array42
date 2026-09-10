@@ -1,119 +1,175 @@
 //! phloat — the HP-42S floating-point type.
 //!
-//! Zig port of Free42's `common/core_phloat.cc` (BCD_MATH path). Backed by
-//! decNumber's `decQuad` (34-digit IEEE 754 decimal128), matching Free42
-//! Decimal's bid128 precision exactly.
+//! Native Zig port of Free42's `common/core_phloat.cc` (BCD_MATH path).
+//! A 34-digit IEEE 754 decimal128 (decQuad) implemented directly in Zig —
+//! no C decNumber dependency. Matches Free42 Decimal's bid128 precision
+//! exactly.
 //!
 //! The transcendental functions (sin, cos, tan, exp, ln, gamma, …) are
-//! deferred to step 3 — decNumber provides only the core arithmetic here, and
-//! those stubs panic loudly rather than return a wrong answer.
+//! built on the core arithmetic (add/sub/mul/div) via argument reduction +
+//! Taylor series, computed to the full 34-digit precision.
 
 const std = @import("std");
 
-// Hand-written extern declarations for the decNumber decQuad subset we use.
-// Replaces @cImport so the Zig frontend never parses the C headers (faster
-// compile, and a step toward a full native port). Signatures mirror
-// vendor/decNumber/decQuad.h + decContext.h exactly.
-const c = struct {
-    // --- types ---------------------------------------------------------------
-    /// The decQuad decimal128 datum: a 16-byte union (DPD-encoded).
-    /// DECUSE64 is not defined when decQuad.h is compiled (decNumberLocal.h
-    /// is included after it), so the C union has no `longs` member — align 4.
-    pub const decQuad = extern union {
-        bytes: [16]u8,
-        shorts: [8]u16,
-        words: [4]u32,
-    };
+// ---------------------------------------------------------------------------
+// Format constants (decQuad = 34-digit decimal128)
+// ---------------------------------------------------------------------------
 
-    /// The decimal context (DECSUBSET=0, so no `extended` field).
-    pub const decContext = extern struct {
-        digits: i32,
-        emax: i32,
-        emin: i32,
-        round: c_int, // enum rounding (C `int`)
-        traps: u32,
-        status: u32,
-        clamp: u8,
-    };
+const DECPMAX: i32 = 34; // max coefficient digits
+const DECEMAX: i32 = 6144; // max exponent
+const DECEMIN: i32 = -6143; // min normal exponent
+const DECQTINY: i32 = -6176; // min subnormal exponent (DECEMIN-(DECPMAX-1))
 
-    // --- rounding modes (enum rounding) --------------------------------------
-    pub const DEC_ROUND_CEILING: c_int = 0;
-    pub const DEC_ROUND_UP: c_int = 1;
-    pub const DEC_ROUND_HALF_UP: c_int = 2;
-    pub const DEC_ROUND_HALF_EVEN: c_int = 3;
-    pub const DEC_ROUND_HALF_DOWN: c_int = 4;
-    pub const DEC_ROUND_DOWN: c_int = 5;
-    pub const DEC_ROUND_FLOOR: c_int = 6;
-    pub const DEC_ROUND_05UP: c_int = 7;
+/// Sticky-bit mapping for round-for-reround (d=0→1, d=5→6, else unchanged).
+const DECSTICKYTAB = [10]u8{ 1, 1, 2, 3, 4, 6, 6, 7, 8, 9 };
 
-    // --- init descriptor -----------------------------------------------------
-    pub const DEC_INIT_DECQUAD: i32 = 128; // DEC_INIT_DECIMAL128
-
-    // --- decContext routines -------------------------------------------------
-    pub extern fn decContextDefault(*decContext, i32) *decContext;
-
-    // --- decQuad conversions -------------------------------------------------
-    pub extern fn decQuadFromString(*decQuad, [*c]const u8, *decContext) *decQuad;
-    pub extern fn decQuadFromInt32(*decQuad, i32) *decQuad;
-    pub extern fn decQuadFromUInt32(*decQuad, u32) *decQuad;
-    pub extern fn decQuadToString(*const decQuad, [*c]u8) [*c]u8;
-    pub extern fn decQuadToInt32(*const decQuad, *decContext, c_int) i32;
-
-    // --- decQuad arithmetic --------------------------------------------------
-    pub extern fn decQuadAdd(*decQuad, *const decQuad, *const decQuad, *decContext) *decQuad;
-    pub extern fn decQuadSubtract(*decQuad, *const decQuad, *const decQuad, *decContext) *decQuad;
-    pub extern fn decQuadMultiply(*decQuad, *const decQuad, *const decQuad, *decContext) *decQuad;
-    pub extern fn decQuadDivide(*decQuad, *const decQuad, *const decQuad, *decContext) *decQuad;
-    pub extern fn decQuadMinus(*decQuad, *const decQuad, *decContext) *decQuad;
-    pub extern fn decQuadAbs(*decQuad, *const decQuad, *decContext) *decQuad;
-    pub extern fn decQuadFMA(*decQuad, *const decQuad, *const decQuad, *const decQuad, *decContext) *decQuad;
-    pub extern fn decQuadToIntegralValue(*decQuad, *const decQuad, *decContext, c_int) *decQuad;
-    pub extern fn decQuadLogB(*decQuad, *const decQuad, *decContext) *decQuad;
-    pub extern fn decQuadScaleB(*decQuad, *const decQuad, *const decQuad, *decContext) *decQuad;
-
-    // --- decQuad comparisons -------------------------------------------------
-    pub extern fn decQuadCompare(*decQuad, *const decQuad, *const decQuad, *decContext) *decQuad;
-
-    // --- decQuad predicates --------------------------------------------------
-    pub extern fn decQuadIsNaN(*const decQuad) u32;
-    pub extern fn decQuadIsInfinite(*const decQuad) u32;
-    pub extern fn decQuadIsZero(*const decQuad) u32;
-    pub extern fn decQuadIsNegative(*const decQuad) u32;
-    pub extern fn decQuadIsFinite(*const decQuad) u32;
-    pub extern fn decQuadIsInteger(*const decQuad) u32;
+/// Rounding modes (mirrors decNumber's `enum rounding`).
+const Rounding = enum {
+    ceiling, // 0
+    up, // 1
+    half_up, // 2
+    half_even, // 3
+    half_down, // 4
+    down, // 5
+    floor, // 6
+    zero_five_up, // 7 (05UP)
 };
 
-/// The phloat type: a 34-digit decimal128 value (16 bytes).
-pub const Phloat = c.decQuad;
+const Class = enum { finite, inf, nan };
+
+/// The phloat type: a 34-digit decimal128 value.
+pub const Phloat = struct {
+    sign: bool = false, // true = negative
+    exponent: i32 = 0, // quantum exponent (base-10)
+    coeff: u128 = 0, // coefficient, no leading zeros (0 for zero/special)
+    class: Class = .finite,
+};
 
 /// Maximum mantissa digits (matches Free42's `MAX_MANT_DIGITS` in BCD mode).
 pub const max_mant_digits = 34;
-
-/// The decimal context (rounding mode, precision, status flags).
-var ctx: c.decContext = undefined;
 
 /// Thread-local scratch for `toString` — the returned slice is only valid
 /// until the next `toString` call on this thread.
 threadlocal var str_buf: [43]u8 = undefined;
 
-/// Initialize the decimal context and the shared constants.
-/// Must be called once before any arithmetic.
-pub fn init() void {
-    _ = c.decContextDefault(&ctx, c.DEC_INIT_DECQUAD);
-    PI = fromString("3.141592653589793238462643383279503");
-    PI_2 = div(PI, fromInt(2));
-    PI_4 = div(PI, fromInt(4));
-    TWO_PI = mul(PI, fromInt(2));
-    LN2 = fromString("0.6931471805599453094172321214581766");
-    LN10 = fromString("2.302585092994045684017991454684364");
-    E = fromString("2.718281828459045235360287471352662");
-    POS_HUGE = fromString("9.999999999999999999999999999999999E+6144");
-    NEG_HUGE = fromString("-9.999999999999999999999999999999999E+6144");
-    POS_TINY = fromString("1E-6143");
-    NEG_TINY = fromString("-1E-6143");
-    NAN = fromString("NaN");
-    NAN_1 = fromString("NaN");
-    NAN_2 = fromString("NaN");
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Powers of ten, 10^0 .. 10^76 (u256 holds up to ~1.16e77, so 10^76 is safe).
+const POW10: [77]u256 = blk: {
+    var t: [77]u256 = undefined;
+    var v: u256 = 1;
+    for (0..77) |i| {
+        t[i] = v;
+        v *= 10;
+    }
+    break :blk t;
+};
+
+fn digitCount(c: u256) i32 {
+    var n: i32 = 0;
+    var x = c;
+    while (x != 0) : (x /= 10) n += 1;
+    return n;
+}
+
+fn nan() Phloat {
+    return .{ .class = .nan };
+}
+
+fn inf(sign: bool) Phloat {
+    return .{ .sign = sign, .class = .inf };
+}
+
+/// Decide whether to bump the kept coefficient, given the reround digit.
+fn decideBump(sign: bool, reround: u8, kept: u256, rmode: Rounding) bool {
+    return switch (rmode) {
+        .half_even => reround > 5 or (reround == 5 and (kept & 1) != 0),
+        .down => false,
+        .half_down => reround > 5,
+        .half_up => reround >= 5,
+        .up => reround > 0,
+        .ceiling => !sign and reround > 0,
+        .floor => sign and reround > 0,
+        .zero_five_up => reround > 0 and (kept % 10 == 0 or kept % 10 == 5),
+    };
+}
+
+const Rounded = struct { coeff: u256, exponent: i32 };
+
+/// Drop `drop` digits from `coeff`, rounding per `rmode`. `sticky` marks
+/// discarded digits beyond the coefficient (division remainder).
+fn roundDigits(sign: bool, coeff: u256, exponent: i32, drop: i32, sticky: bool, rmode: Rounding) Rounded {
+    if (drop <= 0) return .{ .coeff = coeff, .exponent = exponent };
+    const length = digitCount(coeff);
+    var kept: u256 = 0;
+    var reround: u8 = 0;
+    var st = sticky;
+    if (drop < length) {
+        const p = POW10[@intCast(drop)];
+        kept = coeff / p;
+        const dropped = coeff % p;
+        const p1 = POW10[@intCast(drop - 1)];
+        reround = @intCast(dropped / p1);
+        st = st or (dropped % p1) != 0;
+    } else if (drop == length) {
+        kept = 0;
+        const p1 = POW10[@intCast(length - 1)];
+        reround = @intCast(coeff / p1);
+        st = st or (coeff % p1) != 0;
+    } else {
+        kept = 0;
+        reround = 0;
+        st = st or coeff != 0;
+    }
+    if (st) reround = DECSTICKYTAB[reround];
+    if (decideBump(sign, reround, kept, rmode)) kept += 1;
+    return .{ .coeff = kept, .exponent = exponent + drop };
+}
+
+/// Round a full-precision result to 34 digits, handling overflow/underflow.
+fn finalize(sign: bool, coeff: u256, exponent: i32, sticky: bool, rmode: Rounding) Phloat {
+    const length = digitCount(coeff);
+    var drop = length - DECPMAX;
+    const td = DECQTINY - exponent;
+    if (td > drop) drop = td;
+    var c = coeff;
+    var e = exponent;
+    if (drop > 0) {
+        const r = roundDigits(sign, c, e, drop, sticky, rmode);
+        c = r.coeff;
+        e = r.exponent;
+    }
+    // all-nines carry: 34 nines + 1 → 10^33 with exponent+1
+    if (c >= POW10[34]) {
+        c /= 10;
+        e += 1;
+    }
+    // overflow / fold-down
+    if (e > DECEMAX - (DECPMAX - 1)) {
+        if (c == 0) {
+            e = DECEMAX - (DECPMAX - 1);
+        } else {
+            const l2 = digitCount(c);
+            if (e + l2 - 1 > DECEMAX) {
+                const needmax = switch (rmode) {
+                    .down, .zero_five_up => true,
+                    .ceiling => sign,
+                    .floor => !sign,
+                    else => false,
+                };
+                if (needmax) {
+                    return .{ .sign = sign, .exponent = DECEMAX - (DECPMAX - 1), .coeff = POW10[34] - 1, .class = .finite };
+                }
+                return inf(sign);
+            }
+            const shift = e - (DECEMAX - (DECPMAX - 1));
+            c *= POW10[@intCast(shift)];
+            e -= shift;
+        }
+    }
+    return .{ .sign = sign, .exponent = e, .coeff = @intCast(c), .class = .finite };
 }
 
 // ---------------------------------------------------------------------------
@@ -122,25 +178,99 @@ pub fn init() void {
 
 /// Parse a decimal string ("1.23", "-4.5E+10", "Infinity", "NaN", …).
 pub fn fromString(s: []const u8) Phloat {
-    var buf: [64]u8 = undefined;
-    const n = @min(s.len, buf.len - 1);
-    @memcpy(buf[0..n], s[0..n]);
-    buf[n] = 0;
-    var p: Phloat = undefined;
-    _ = c.decQuadFromString(&p, &buf, &ctx);
-    return p;
+    var i: usize = 0;
+    var sign = false;
+    if (i < s.len and (s[i] == '-' or s[i] == '+')) {
+        sign = s[i] == '-';
+        i += 1;
+    }
+    // specials
+    if (i < s.len and (s[i] == 'i' or s[i] == 'I')) {
+        // "inf" or "infinity"
+        const rest = s[i..];
+        if (std.ascii.eqlIgnoreCase(rest, "inf") or std.ascii.eqlIgnoreCase(rest, "infinity")) {
+            return inf(sign);
+        }
+    }
+    if (i < s.len and (s[i] == 'n' or s[i] == 'N')) {
+        const rest = s[i..];
+        if (std.ascii.eqlIgnoreCase(rest, "nan") or std.ascii.eqlIgnoreCase(rest, "snan")) {
+            return nan();
+        }
+    }
+    // finite: parse digits, dot, exponent
+    var coeff: u256 = 0;
+    var sig_total: i32 = 0; // significant digits (after leading zeros)
+    var frac_digits: i32 = 0; // digits after the decimal point
+    var seen_dot = false;
+    var seen_digit = false;
+    var leading = true;
+    var kept: i32 = 0; // digits kept in coeff (<= 35)
+    var sticky = false;
+    while (i < s.len) {
+        const ch = s[i];
+        if (ch >= '0' and ch <= '9') {
+            seen_digit = true;
+            const d: u8 = ch - '0';
+            if (leading and d == 0) {
+                if (seen_dot) frac_digits += 1;
+                i += 1;
+                continue;
+            }
+            leading = false;
+            if (kept < 35) {
+                coeff = coeff * 10 + d;
+                kept += 1;
+            } else if (d != 0) {
+                sticky = true;
+            }
+            sig_total += 1;
+            if (seen_dot) frac_digits += 1;
+            i += 1;
+            continue;
+        }
+        if (ch == '.' and !seen_dot) {
+            seen_dot = true;
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    if (!seen_digit) return nan(); // bad syntax
+    var expo: i32 = 0;
+    if (i < s.len and (s[i] == 'E' or s[i] == 'e')) {
+        i += 1;
+        var esign = false;
+        if (i < s.len and (s[i] == '-' or s[i] == '+')) {
+            esign = s[i] == '-';
+            i += 1;
+        }
+        var edigits: i32 = 0;
+        var eval: i64 = 0;
+        while (i < s.len and s[i] >= '0' and s[i] <= '9') {
+            eval = eval * 10 + (s[i] - '0');
+            edigits += 1;
+            i += 1;
+        }
+        if (edigits > 4) {
+            expo = if (esign) -12288 else 12288;
+        } else {
+            expo = @intCast(if (esign) -eval else eval);
+        }
+    }
+    const exponent = expo - frac_digits + (sig_total - kept);
+    return finalize(sign, coeff, exponent, sticky, .half_even);
 }
 
 pub fn fromInt(i: i32) Phloat {
-    var p: Phloat = undefined;
-    _ = c.decQuadFromInt32(&p, i);
-    return p;
+    if (i == 0) return .{ .coeff = 0, .exponent = 0, .class = .finite };
+    const is_neg = i < 0;
+    const u: u32 = if (is_neg) @intCast(-@as(i64, i)) else @intCast(i);
+    return .{ .sign = is_neg, .exponent = 0, .coeff = u, .class = .finite };
 }
 
 pub fn fromUint(u: u32) Phloat {
-    var p: Phloat = undefined;
-    _ = c.decQuadFromUInt32(&p, u);
-    return p;
+    return .{ .exponent = 0, .coeff = u, .class = .finite };
 }
 
 pub fn fromInt64(i: i64) Phloat {
@@ -165,16 +295,148 @@ pub fn fromDouble(d: f64) Phloat {
 // Conversion
 // ---------------------------------------------------------------------------
 
+fn writeUint(buf: []u8, start: usize, v: u32) usize {
+    var tmp: [10]u8 = undefined;
+    var n: usize = 0;
+    var x = v;
+    if (x == 0) {
+        tmp[0] = '0';
+        n = 1;
+    } else {
+        while (x != 0) : (x /= 10) {
+            tmp[n] = @intCast('0' + (x % 10));
+            n += 1;
+        }
+    }
+    var j = start;
+    var k = n;
+    while (k > 0) {
+        k -= 1;
+        buf[j] = tmp[k];
+        j += 1;
+    }
+    return n;
+}
+
 /// Format as a decimal string. The returned slice is valid until the next
 /// `toString` call on this thread.
 pub fn toString(p: Phloat) []const u8 {
-    _ = c.decQuadToString(&p, &str_buf);
+    var i: usize = 0;
+    if (p.sign) {
+        str_buf[i] = '-';
+        i += 1;
+    }
+    switch (p.class) {
+        .nan => {
+            @memcpy(str_buf[i..][0..3], "NaN");
+            i += 3;
+        },
+        .inf => {
+            @memcpy(str_buf[i..][0..8], "Infinity");
+            i += 8;
+        },
+        .finite => {
+            var digits: [34]u8 = undefined;
+            var nd: usize = 0;
+            var c = p.coeff;
+            if (c == 0) {
+                digits[0] = '0';
+                nd = 1;
+            } else {
+                var tmp: [34]u8 = undefined;
+                var n: usize = 0;
+                while (c != 0) : (c /= 10) {
+                    tmp[n] = @intCast('0' + (c % 10));
+                    n += 1;
+                }
+                for (0..n) |k| digits[k] = tmp[n - 1 - k];
+                nd = n;
+            }
+            const expo = p.exponent;
+            const pre: i32 = @as(i32, @intCast(nd)) + expo;
+            if (expo > 0 or pre < -5) {
+                const e = pre - 1;
+                str_buf[i] = digits[0];
+                i += 1;
+                if (nd > 1) {
+                    str_buf[i] = '.';
+                    i += 1;
+                    for (digits[1..nd]) |d| {
+                        str_buf[i] = d;
+                        i += 1;
+                    }
+                }
+                str_buf[i] = 'E';
+                i += 1;
+                if (e < 0) {
+                    str_buf[i] = '-';
+                    i += 1;
+                } else {
+                    str_buf[i] = '+';
+                    i += 1;
+                }
+                i += writeUint(&str_buf, i, @intCast(@abs(e)));
+            } else if (pre > 0) {
+                const pu: usize = @intCast(pre);
+                if (pu >= nd) {
+                    for (digits[0..nd]) |d| {
+                        str_buf[i] = d;
+                        i += 1;
+                    }
+                    for (0..(pu - nd)) |_| {
+                        str_buf[i] = '0';
+                        i += 1;
+                    }
+                } else {
+                    for (digits[0..pu]) |d| {
+                        str_buf[i] = d;
+                        i += 1;
+                    }
+                    str_buf[i] = '.';
+                    i += 1;
+                    for (digits[pu..nd]) |d| {
+                        str_buf[i] = d;
+                        i += 1;
+                    }
+                }
+            } else {
+                str_buf[i] = '0';
+                i += 1;
+                str_buf[i] = '.';
+                i += 1;
+                const zeros: usize = @intCast(-pre);
+                for (0..zeros) |_| {
+                    str_buf[i] = '0';
+                    i += 1;
+                }
+                for (digits[0..nd]) |d| {
+                    str_buf[i] = d;
+                    i += 1;
+                }
+            }
+        },
+    }
+    str_buf[i] = 0;
     return std.mem.sliceTo(&str_buf, 0);
 }
 
-/// Truncate toward zero and convert to i32 (undefined if out of range).
+/// Truncate toward zero and convert to i32 (0 if out of range or special).
 pub fn toInt(p: Phloat) i32 {
-    return c.decQuadToInt32(&p, &ctx, c.DEC_ROUND_DOWN);
+    if (p.class != .finite) return 0;
+    var coeff = p.coeff;
+    var expo = p.exponent;
+    if (expo < 0) {
+        const drop = -expo;
+        if (drop >= 34) return 0;
+        coeff = @intCast(@as(u256, coeff) / POW10[@intCast(drop)]);
+        expo = 0;
+    }
+    if (coeff == 0) return 0;
+    if (expo >= 10) return 0;
+    const v: u256 = if (expo == 0) coeff else @as(u256, coeff) * POW10[@intCast(expo)];
+    if (v > 2147483647) return 0;
+    const iv: i32 = @intCast(v);
+    return if (p.sign) -iv else iv;
 }
 
 pub fn toInt64(p: Phloat) i64 {
@@ -191,11 +453,39 @@ pub fn toDouble(p: Phloat) f64 {
 // Comparison
 // ---------------------------------------------------------------------------
 
+fn compareMagnitude(ca: u128, ea: i32, cb: u128, eb: i32) i32 {
+    if (ca == 0 and cb == 0) return 0;
+    if (ca == 0) return -1;
+    if (cb == 0) return 1;
+    const shift = ea - eb;
+    if (shift == 0) {
+        return if (ca < cb) -1 else if (ca > cb) 1 else 0;
+    }
+    if (shift > 0) {
+        if (shift >= 34) return 1;
+        const scaled = @as(u256, ca) * POW10[@intCast(shift)];
+        return if (scaled < cb) -1 else if (scaled > cb) 1 else 0;
+    }
+    const s = -shift;
+    if (s >= 34) return -1;
+    const scaled = @as(u256, cb) * POW10[@intCast(s)];
+    return if (ca < scaled) -1 else if (ca > scaled) 1 else 0;
+}
+
 /// Three-way comparison: -1, 0, or 1 (NaN compares unordered → returns 0).
 fn compare(a: Phloat, b: Phloat) i32 {
-    var r: Phloat = undefined;
-    _ = c.decQuadCompare(&r, &a, &b, &ctx);
-    return c.decQuadToInt32(&r, &ctx, c.DEC_ROUND_DOWN);
+    if (a.class == .nan or b.class == .nan) return 0;
+    if (a.class == .inf or b.class == .inf) {
+        if (a.class == .inf and b.class == .inf) {
+            if (a.sign == b.sign) return 0;
+            return if (a.sign) -1 else 1;
+        }
+        if (a.class == .inf) return if (a.sign) -1 else 1;
+        return if (b.sign) 1 else -1;
+    }
+    if (a.sign != b.sign) return if (a.sign) -1 else 1;
+    const c = compareMagnitude(a.coeff, a.exponent, b.coeff, b.exponent);
+    return if (a.sign) -c else c;
 }
 
 pub fn eq(a: Phloat, b: Phloat) bool {
@@ -221,46 +511,130 @@ pub fn ge(a: Phloat, b: Phloat) bool {
 // Arithmetic
 // ---------------------------------------------------------------------------
 
+fn addFinite(a: Phloat, b: Phloat) Phloat {
+    if (a.coeff == 0) return b;
+    if (b.coeff == 0) return a;
+    const e = @min(a.exponent, b.exponent);
+    const sa = a.exponent - e;
+    const sb = b.exponent - e;
+    const da = digitCount(@as(u256, a.coeff));
+    const db = digitCount(@as(u256, b.coeff));
+    // If the larger operand's shifted coefficient would overflow u256, the
+    // smaller operand is entirely below the 34-digit precision: it contributes
+    // only a sticky bit (and, for opposite signs, a borrow that rounds back up).
+    if (sa > 0 and da + sa > 76) {
+        return finalize(a.sign, a.coeff, a.exponent, b.coeff != 0, .half_even);
+    }
+    if (sb > 0 and db + sb > 76) {
+        return finalize(b.sign, b.coeff, b.exponent, a.coeff != 0, .half_even);
+    }
+    const ca = @as(u256, a.coeff) * POW10[@intCast(sa)];
+    const cb = @as(u256, b.coeff) * POW10[@intCast(sb)];
+    var sign: bool = undefined;
+    var coeff: u256 = undefined;
+    if (a.sign == b.sign) {
+        sign = a.sign;
+        coeff = ca + cb;
+    } else if (ca >= cb) {
+        sign = a.sign;
+        coeff = ca - cb;
+    } else {
+        sign = b.sign;
+        coeff = cb - ca;
+    }
+    if (coeff == 0 and a.sign != b.sign) {
+        // exact zero: +0 except FLOOR → -0 (context is HALF_EVEN, so +0)
+        sign = false;
+    }
+    return finalize(sign, coeff, e, false, .half_even);
+}
+
 pub fn add(a: Phloat, b: Phloat) Phloat {
-    var r: Phloat = undefined;
-    _ = c.decQuadAdd(&r, &a, &b, &ctx);
-    return r;
+    if (a.class == .nan or b.class == .nan) return nan();
+    if (a.class == .inf or b.class == .inf) {
+        if (a.class == .inf and b.class == .inf) {
+            if (a.sign != b.sign) return nan();
+            return inf(a.sign);
+        }
+        if (a.class == .inf) return inf(a.sign);
+        return inf(b.sign);
+    }
+    return addFinite(a, b);
 }
+
 pub fn sub(a: Phloat, b: Phloat) Phloat {
-    var r: Phloat = undefined;
-    _ = c.decQuadSubtract(&r, &a, &b, &ctx);
-    return r;
+    if (b.class == .nan) return nan();
+    return add(a, neg(b));
 }
+
 pub fn mul(a: Phloat, b: Phloat) Phloat {
-    var r: Phloat = undefined;
-    _ = c.decQuadMultiply(&r, &a, &b, &ctx);
-    return r;
+    if (a.class == .nan or b.class == .nan) return nan();
+    if (a.class == .inf or b.class == .inf) {
+        if ((a.class == .inf and b.coeff == 0 and b.class == .finite) or
+            (b.class == .inf and a.coeff == 0 and a.class == .finite)) return nan();
+        return inf(a.sign != b.sign);
+    }
+    const sign = a.sign != b.sign;
+    const coeff = @as(u256, a.coeff) * @as(u256, b.coeff);
+    const exponent = a.exponent + b.exponent;
+    return finalize(sign, coeff, exponent, false, .half_even);
 }
+
 pub fn div(a: Phloat, b: Phloat) Phloat {
-    var r: Phloat = undefined;
-    _ = c.decQuadDivide(&r, &a, &b, &ctx);
-    return r;
+    if (a.class == .nan or b.class == .nan) return nan();
+    if (a.class == .inf or b.class == .inf) {
+        if (a.class == .inf and b.class == .inf) return nan();
+        if (a.class == .inf) return inf(a.sign != b.sign);
+        // finite / inf = 0
+        return .{ .sign = a.sign != b.sign, .exponent = 0, .coeff = 0, .class = .finite };
+    }
+    if (b.coeff == 0) {
+        if (a.coeff == 0) return nan();
+        return inf(a.sign != b.sign);
+    }
+    if (a.coeff == 0) {
+        return .{ .sign = a.sign != b.sign, .exponent = a.exponent - b.exponent, .coeff = 0, .class = .finite };
+    }
+    // finite / finite: quotient to 35 digits (one guard digit for rounding).
+    const sign = a.sign != b.sign;
+    const da = digitCount(@as(u256, a.coeff));
+    const db = digitCount(@as(u256, b.coeff));
+    const scale = 35 - da + db;
+    const num = @as(u256, a.coeff) * POW10[@intCast(scale)];
+    const q = num / @as(u256, b.coeff);
+    const rem = num % @as(u256, b.coeff);
+    const sticky = rem != 0;
+    var exponent = a.exponent - b.exponent - scale;
+    var coeff = q;
+    // drop trailing zeros for exact results
+    if (!sticky) {
+        while (coeff % 10 == 0) {
+            coeff /= 10;
+            exponent += 1;
+        }
+    }
+    return finalize(sign, coeff, exponent, sticky, .half_even);
 }
+
 pub fn neg(a: Phloat) Phloat {
-    var r: Phloat = undefined;
-    _ = c.decQuadMinus(&r, &a, &ctx);
-    return r;
+    if (a.class == .nan) return nan();
+    if (a.class == .inf) return inf(!a.sign);
+    if (a.coeff == 0) return .{ .sign = false, .exponent = a.exponent, .coeff = 0, .class = .finite };
+    return .{ .sign = !a.sign, .exponent = a.exponent, .coeff = a.coeff, .class = .finite };
 }
+
 pub fn abs(a: Phloat) Phloat {
-    var r: Phloat = undefined;
-    _ = c.decQuadAbs(&r, &a, &ctx);
-    return r;
+    if (a.class == .nan) return nan();
+    return .{ .sign = false, .exponent = a.exponent, .coeff = a.coeff, .class = a.class };
 }
+
 pub fn fma(x: Phloat, y: Phloat, z: Phloat) Phloat {
-    var r: Phloat = undefined;
-    _ = c.decQuadFMA(&r, &x, &y, &z, &ctx);
-    return r;
+    return add(mul(x, y), z);
 }
 
 /// Floating-point remainder: `x - trunc(x/y) * y`, with the sign of `x`.
-/// (decNumber has no fmod, so this is built from the primitives.)
 pub fn fmod(x: Phloat, y: Phloat) Phloat {
-    if (isZero(y)) return NAN;
+    if (isZero(y)) return nan();
     const q = trunc(div(x, y));
     return sub(x, mul(q, y));
 }
@@ -277,23 +651,26 @@ pub fn pow10(n: i32) Phloat {
     return r;
 }
 
-fn toIntegral(p: Phloat, rounding: c_int) Phloat {
-    var r: Phloat = undefined;
-    _ = c.decQuadToIntegralValue(&r, &p, &ctx, rounding);
-    return r;
+fn toIntegral(p: Phloat, rmode: Rounding) Phloat {
+    if (p.class == .nan) return nan();
+    if (p.class == .inf) return p;
+    if (p.exponent >= 0) return p;
+    const drop = -p.exponent;
+    const r = roundDigits(p.sign, p.coeff, p.exponent, drop, false, rmode);
+    return .{ .sign = p.sign, .exponent = r.exponent, .coeff = @intCast(r.coeff), .class = .finite };
 }
 
 pub fn floor(p: Phloat) Phloat {
-    return toIntegral(p, c.DEC_ROUND_FLOOR);
+    return toIntegral(p, .floor);
 }
 pub fn ceil(p: Phloat) Phloat {
-    return toIntegral(p, c.DEC_ROUND_CEILING);
+    return toIntegral(p, .ceiling);
 }
 pub fn trunc(p: Phloat) Phloat {
-    return toIntegral(p, c.DEC_ROUND_DOWN);
+    return toIntegral(p, .down);
 }
 pub fn round(p: Phloat) Phloat {
-    return toIntegral(p, c.DEC_ROUND_HALF_EVEN);
+    return toIntegral(p, .half_even);
 }
 
 // ---------------------------------------------------------------------------
@@ -301,22 +678,26 @@ pub fn round(p: Phloat) Phloat {
 // ---------------------------------------------------------------------------
 
 pub fn isNaN(p: Phloat) bool {
-    return c.decQuadIsNaN(&p) != 0;
+    return p.class == .nan;
 }
 pub fn isInf(p: Phloat) bool {
-    return c.decQuadIsInfinite(&p) != 0;
+    return p.class == .inf;
 }
 pub fn isZero(p: Phloat) bool {
-    return c.decQuadIsZero(&p) != 0;
+    return p.class == .finite and p.coeff == 0;
 }
 pub fn isNegative(p: Phloat) bool {
-    return c.decQuadIsNegative(&p) != 0;
+    return switch (p.class) {
+        .nan => false,
+        .inf => p.sign,
+        .finite => p.sign and p.coeff != 0,
+    };
 }
 pub fn isFinite(p: Phloat) bool {
-    return c.decQuadIsFinite(&p) != 0;
+    return p.class == .finite;
 }
 pub fn isInteger(p: Phloat) bool {
-    return c.decQuadIsInteger(&p) != 0;
+    return p.class == .finite and p.exponent >= 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -338,11 +719,29 @@ pub var NAN: Phloat = undefined;
 pub var NAN_1: Phloat = undefined;
 pub var NAN_2: Phloat = undefined;
 
+/// Initialize the shared constants. Must be called once before any arithmetic.
+pub fn init() void {
+    PI = fromString("3.141592653589793238462643383279503");
+    PI_2 = div(PI, fromInt(2));
+    PI_4 = div(PI, fromInt(4));
+    TWO_PI = mul(PI, fromInt(2));
+    LN2 = fromString("0.6931471805599453094172321214581766");
+    LN10 = fromString("2.302585092994045684017991454684364");
+    E = fromString("2.718281828459045235360287471352662");
+    POS_HUGE = fromString("9.999999999999999999999999999999999E+6144");
+    NEG_HUGE = fromString("-9.999999999999999999999999999999999E+6144");
+    POS_TINY = fromString("1E-6143");
+    NEG_TINY = fromString("-1E-6143");
+    NAN = fromString("NaN");
+    NAN_1 = fromString("NaN");
+    NAN_2 = fromString("NaN");
+}
+
 // ---------------------------------------------------------------------------
-// Transcendentals — built on decNumber's core arithmetic.
+// Transcendentals — built on the core arithmetic.
 //
-// decNumber provides only add/sub/mul/div, so these are implemented from
-// argument reduction + Taylor series, computed to the full 34-digit decQuad
+// add/sub/mul/div are the only primitives, so these are implemented from
+// argument reduction + Taylor series, computed to the full 34-digit
 // precision. Each series runs until the running sum stops changing (i.e. the
 // next term is below the last representable digit), with a safety cap.
 // ---------------------------------------------------------------------------
@@ -724,20 +1123,16 @@ pub fn tgamma(p: Phloat) Phloat {
 }
 
 /// Base-10 exponent: returns e such that x = m * 10^e with m in [1, 10).
-/// (decNumber's LogB is base-10, unlike C's base-2 `ilogb`.)
 pub fn logb(x: Phloat) i32 {
-    var r: Phloat = undefined;
-    _ = c.decQuadLogB(&r, &x, &ctx);
-    return toInt(r);
+    if (x.class != .finite or x.coeff == 0) return 0;
+    return x.exponent + digitCount(@as(u256, x.coeff)) - 1;
 }
 
-/// Scale by a power of ten: returns x * 10^y. (decNumber's ScaleB is base-10,
-/// unlike C's base-2 `scalbn`.)
+/// Scale by a power of ten: returns x * 10^y.
 pub fn scaleb(x: Phloat, y: i32) Phloat {
-    var r: Phloat = undefined;
-    const n = fromInt(y);
-    _ = c.decQuadScaleB(&r, &x, &n, &ctx);
-    return r;
+    if (x.class == .nan) return nan();
+    if (x.class == .inf) return x;
+    return finalize(x.sign, x.coeff, x.exponent + y, false, .half_even);
 }
 
 // ---------------------------------------------------------------------------
