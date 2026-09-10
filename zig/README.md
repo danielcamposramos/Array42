@@ -38,6 +38,8 @@ zig build          # compile (array42 demo + array42-mcp server)
 zig build run      # run the vertical-slice demo
 zig build mcp      # run the MCP server (stdio JSON-RPC)
 zig build test     # run all unit tests
+zig build gen      # generate MR (comment-stripped) + HR (docs) from src/
+zig build mr-build # compile array42-mcp from the MR sources
 ```
 
 ## Using the MCP server
@@ -81,6 +83,22 @@ body, adapted to each harness's format:
 | Aider | — (reads the shared skill via `AGENTS.md`) | `.aider.conf.yml` → `.mcp.json` |
 | Gemini CLI | `GEMINI.md` | `~/.gemini/settings.json` |
 | Any AGENTS.md harness | `AGENTS.md` (repo root) | — |
+
+## SOURCE / MR / HR
+
+The Zig source tree follows the EchoSystems SOURCE/MR/HR doctrine. Partners
+edit the SOURCE only; the MR and HR siblings are generated, never hand-edited:
+
+- **SOURCE** — `src/*.zig`, canonical truth (comments + implementation).
+- **MR** — `zig-out/mr/*.zig`, machine runtime: comment-stripped, what the
+  Zig compiler consumes (`zig build mr-build` compiles the MCP server from it).
+- **HR** — `zig-out/hr/*.zig.md`, human-readable projection: the doc comments
+  (`///` and `//!`) extracted into markdown.
+
+The compiler is `tools/hrmr.zig` (built as the `hrmr` executable). `zig build
+gen` runs it; `zig build mr-build` regenerates the MR and compiles from it.
+The MR pass is a lexical scan that strips line and nested block comments while
+preserving string, char, and multiline-string literals verbatim.
 
 ## Design
 

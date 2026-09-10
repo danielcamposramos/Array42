@@ -68,6 +68,40 @@ pub fn build(b: *std.Build) void {
     const mcp_run_step = b.step("mcp", "Run the array42 MCP server");
     mcp_run_step.dependOn(&mcp_run_cmd.step);
 
+    // hrmr — the HR/MR compiler (SOURCE/MR/HR doctrine). Generates the
+    // comment-stripped MR sources (zig-out/mr/) and the doc-comment HR
+    // projection (zig-out/hr/) from src/.
+    const hrmr_exe = b.addExecutable(.{
+        .name = "hrmr",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/hrmr.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const hrmr_run = b.addRunArtifact(hrmr_exe);
+    hrmr_run.addArgs(&.{ "src", "zig-out/mr", "zig-out/hr" });
+    const gen_step = b.step("gen", "Generate MR (comment-stripped) + HR (docs) from src/");
+    gen_step.dependOn(&hrmr_run.step);
+
+    // mr-build — compile the MCP server from the MR (comment-stripped) sources,
+    // the "final runtime shape" per the SOURCE/MR/HR doctrine.
+    const mr_mcp = b.addExecutable(.{
+        .name = "array42-mcp-mr",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig-out/mr/mcp_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    mr_mcp.root_module.addIncludePath(b.path("vendor/decNumber"));
+    mr_mcp.root_module.linkLibrary(decnumber);
+    mr_mcp.step.dependOn(&hrmr_run.step);
+    b.installArtifact(mr_mcp);
+    const mr_build_step = b.step("mr-build", "Compile array42-mcp from the MR (comment-stripped) sources");
+    mr_build_step.dependOn(b.getInstallStep());
+
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/tests.zig"),
