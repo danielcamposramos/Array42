@@ -9,6 +9,7 @@ const std = @import("std");
 const phloat = @import("phloat.zig");
 const vartype = @import("vartype.zig");
 const globals = @import("globals.zig");
+const linalg = @import("linalg.zig");
 
 const Err = globals.Err;
 const Vartype = vartype.Vartype;
@@ -431,10 +432,21 @@ pub fn genericSub(px: *const Vartype, py: *const Vartype, dst: *?*Vartype) Err {
     return mapBinary(px, py, dst, subRR, subRC, subCR, subCC);
 }
 pub fn genericMul(px: *const Vartype, py: *const Vartype, dst: *?*Vartype) Err {
+    // Matrix × matrix is the linear-algebra product, not element-wise.
+    if (isMatrix(px) and isMatrix(py)) return linalg.linalgMul(py, px, dst);
     return mapBinary(px, py, dst, mulRR, mulRC, mulCR, mulCC);
 }
 pub fn genericDiv(px: *const Vartype, py: *const Vartype, dst: *?*Vartype) Err {
+    // Matrix ÷ matrix is the linear-algebra solve, not element-wise.
+    if (isMatrix(px) and isMatrix(py)) return linalg.linalgDiv(py, px, dst);
     return mapBinary(px, py, dst, divRR, divRC, divCR, divCC);
+}
+
+fn isMatrix(v: *const Vartype) bool {
+    return switch (v.*) {
+        .realmatrix, .complexmatrix => true,
+        else => false,
+    };
 }
 
 /// True if a vartype is a numeric type (real/complex/matrix).

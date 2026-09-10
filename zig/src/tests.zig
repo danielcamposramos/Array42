@@ -8,5 +8,6 @@ comptime {
     _ = @import("display.zig");
     _ = @import("commands1.zig");
     _ = @import("commands2.zig");
+    _ = @import("commands3.zig");
     _ = @import("linalg.zig");
 }
