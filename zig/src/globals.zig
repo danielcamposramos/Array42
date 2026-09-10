@@ -53,6 +53,7 @@ pub const Err = enum(i32) {
     big_stack_disabled = 37,
     invalid_context = 38,
     name_too_long = 39,
+    syntax_error = 40,
 };
 
 /// Human-readable text for each error (subset of Free42's `errors[]`).
@@ -98,6 +99,7 @@ pub fn errText(e: Err) []const u8 {
         .big_stack_disabled => "Big Stack Disabled",
         .invalid_context => "Invalid Context",
         .name_too_long => "Name Too Long",
+        .syntax_error => "Syntax Error",
     };
 }
 

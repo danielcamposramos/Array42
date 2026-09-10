@@ -18,12 +18,12 @@ const Vartype = vartype.Vartype;
 // Mappable function types (matches core_sto_rcl.h)
 // ---------------------------------------------------------------------------
 
-const MappableR = *const fn (x: phloat.Phloat, y: *phloat.Phloat) Err;
-const MappableC = *const fn (xre: phloat.Phloat, xim: phloat.Phloat, yre: *phloat.Phloat, yim: *phloat.Phloat) Err;
-const MappableRR = *const fn (x: phloat.Phloat, y: phloat.Phloat, z: *phloat.Phloat) Err;
-const MappableRC = *const fn (x: phloat.Phloat, yre: phloat.Phloat, yim: phloat.Phloat, zre: *phloat.Phloat, zim: *phloat.Phloat) Err;
-const MappableCR = *const fn (xre: phloat.Phloat, xim: phloat.Phloat, y: phloat.Phloat, zre: *phloat.Phloat, zim: *phloat.Phloat) Err;
-const MappableCC = *const fn (xre: phloat.Phloat, xim: phloat.Phloat, yre: phloat.Phloat, yim: phloat.Phloat, zre: *phloat.Phloat, zim: *phloat.Phloat) Err;
+pub const MappableR = *const fn (x: phloat.Phloat, y: *phloat.Phloat) Err;
+pub const MappableC = *const fn (xre: phloat.Phloat, xim: phloat.Phloat, yre: *phloat.Phloat, yim: *phloat.Phloat) Err;
+pub const MappableRR = *const fn (x: phloat.Phloat, y: phloat.Phloat, z: *phloat.Phloat) Err;
+pub const MappableRC = *const fn (x: phloat.Phloat, yre: phloat.Phloat, yim: phloat.Phloat, zre: *phloat.Phloat, zim: *phloat.Phloat) Err;
+pub const MappableCR = *const fn (xre: phloat.Phloat, xim: phloat.Phloat, y: phloat.Phloat, zre: *phloat.Phloat, zim: *phloat.Phloat) Err;
+pub const MappableCC = *const fn (xre: phloat.Phloat, xim: phloat.Phloat, yre: phloat.Phloat, yim: phloat.Phloat, zre: *phloat.Phloat, zim: *phloat.Phloat) Err;
 
 /// `p_isinf`: -1 for -Inf, 0 for finite, +1 for +Inf.
 fn pIsinf(p: phloat.Phloat) i32 {
