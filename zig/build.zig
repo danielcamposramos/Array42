@@ -49,6 +49,25 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run array42");
     run_step.dependOn(&run_cmd.step);
 
+    // array42-mcp — the calculator exposed as an MCP server (stdio JSON-RPC).
+    const mcp_exe = b.addExecutable(.{
+        .name = "array42-mcp",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/mcp_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    mcp_exe.root_module.addIncludePath(b.path("vendor/decNumber"));
+    mcp_exe.root_module.linkLibrary(decnumber);
+    b.installArtifact(mcp_exe);
+
+    const mcp_run_cmd = b.addRunArtifact(mcp_exe);
+    mcp_run_cmd.step.dependOn(b.getInstallStep());
+    const mcp_run_step = b.step("mcp", "Run the array42 MCP server");
+    mcp_run_step.dependOn(&mcp_run_cmd.step);
+
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/tests.zig"),

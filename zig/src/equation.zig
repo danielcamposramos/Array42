@@ -438,7 +438,10 @@ fn applyUnary(op: Op, src: *Vartype, out: *?*Vartype) Err {
         },
     };
     vartype.free(src);
-    if (e != .none) return e;
+    if (e != .none) {
+        out.* = null;
+        return e;
+    }
     out.* = res;
     return .none;
 }
@@ -461,7 +464,10 @@ fn applyBinaryOp(op: Op, left: *Vartype, right: *Vartype, out: *?*Vartype) Err {
     };
     vartype.free(left);
     vartype.free(right);
-    if (e != .none) return e;
+    if (e != .none) {
+        out.* = null;
+        return e;
+    }
     out.* = res;
     return .none;
 }
@@ -1175,4 +1181,23 @@ test "variables and errors" {
     try std.testing.expectEqual(Err.syntax_error, evalEquation("1+"));
     try std.testing.expectEqual(Err.syntax_error, evalEquation("(1+2"));
     try std.testing.expectEqual(Err.syntax_error, evalEquation(""));
+}
+
+test "error paths free operands exactly once" {
+    globals.init();
+    defer globals.deinit();
+    defer variables.deinit();
+
+    // Binary-op error (applyBinaryOp frees both operands, then errors).
+    try std.testing.expectEqual(Err.divide_by_0, evalEquation("1/0"));
+    try std.testing.expectEqual(Err.divide_by_0, evalEquation("1/(2-2)"));
+
+    // Unary-op error (applyUnary frees the operand, then errors).
+    try std.testing.expectEqual(Err.invalid_data, evalEquation("sqrt(-1)"));
+    try std.testing.expectEqual(Err.invalid_data, evalEquation("(-3)!"));
+    try std.testing.expectEqual(Err.divide_by_0, evalEquation("inv(0)"));
+
+    // The stack must still be usable after the errors.
+    try std.testing.expectEqual(Err.none, evalEquation("1+2"));
+    try expectReal(3);
 }

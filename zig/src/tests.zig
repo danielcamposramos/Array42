@@ -13,4 +13,5 @@ comptime {
     _ = @import("variables.zig");
     _ = @import("linalg.zig");
     _ = @import("equation.zig");
+    _ = @import("mcp.zig");
 }
