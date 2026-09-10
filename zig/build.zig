@@ -51,7 +51,7 @@ pub fn build(b: *std.Build) void {
 
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/phloat.zig"),
+            .root_source_file = b.path("src/tests.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
@@ -60,6 +60,6 @@ pub fn build(b: *std.Build) void {
     unit_tests.root_module.addIncludePath(b.path("vendor/decNumber"));
     unit_tests.root_module.linkLibrary(decnumber);
     const run_unit_tests = b.addRunArtifact(unit_tests);
-    const test_step = b.step("test", "Run phloat unit tests");
+    const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(&run_unit_tests.step);
 }

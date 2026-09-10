@@ -183,9 +183,29 @@ pub fn fma(x: Phloat, y: Phloat, z: Phloat) Phloat {
     return r;
 }
 
+/// Floating-point remainder: `x - trunc(x/y) * y`, with the sign of `x`.
+/// (decNumber has no fmod, so this is built from the primitives.)
+pub fn fmod(x: Phloat, y: Phloat) Phloat {
+    if (isZero(y)) return NAN;
+    const q = trunc(div(x, y));
+    return sub(x, mul(q, y));
+}
+
+/// 10^n for integer n (used by RND and the display formatter).
+pub fn pow10(n: i32) Phloat {
+    if (n == 0) return fromInt(1);
+    var r = fromInt(1);
+    const base = fromInt(10);
+    var e = if (n < 0) -n else n;
+    while (e > 0) : (e -= 1) {
+        r = if (n < 0) div(r, base) else mul(r, base);
+    }
+    return r;
+}
+
 fn toIntegral(p: Phloat, rounding: c_uint) Phloat {
     var r: Phloat = undefined;
-    _ = c.decQuadToIntegralValue(&r, &p, &ctx, @enumFromInt(rounding));
+    _ = c.decQuadToIntegralValue(&r, &p, &ctx, rounding);
     return r;
 }
 
@@ -242,7 +262,7 @@ pub var NAN_2: Phloat = undefined;
 // Transcendentals — deferred to step 3 (decNumber lacks trig/gamma).
 // ---------------------------------------------------------------------------
 
-fn notYet(name: []const u8) noreturn {
+fn notYet(comptime name: []const u8) noreturn {
     @panic(std.fmt.comptimePrint("phloat.{s}: not yet implemented (step 3)", .{name}));
 }
 
@@ -337,11 +357,6 @@ pub fn tgamma(p: Phloat) Phloat {
 pub fn sqrt(p: Phloat) Phloat {
     _ = p;
     notYet("sqrt");
-}
-pub fn fmod(x: Phloat, y: Phloat) Phloat {
-    _ = x;
-    _ = y;
-    notYet("fmod");
 }
 pub fn pow(x: Phloat, y: Phloat) Phloat {
     _ = x;
