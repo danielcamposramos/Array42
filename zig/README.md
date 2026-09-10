@@ -66,6 +66,22 @@ use the tools. The tools are:
 | `clear()` | Clear the stack |
 | `mode(angle)` | Set the angle mode (`deg`/`rad`/`grad`) |
 
+## Harness skills
+
+The MCP server is harness-agnostic; each AI harness gets a companion skill
+that teaches it the tools and the key semantics (exact decimal, degrees-by-
+default angle mode, addressable arrays, real-mode only). All share the same
+body, adapted to each harness's format:
+
+| Harness | Skill | MCP registration |
+|---|---|---|
+| Claude Code | `.claude/skills/array42/SKILL.md` | `.mcp.json` |
+| Codex (OpenAI) | `.codex/skills/array42/SKILL.md` | `.codex/config.toml` |
+| Cursor | `.cursor/rules/array42.mdc` | `.cursor/mcp.json` |
+| Aider | — (reads the shared skill via `AGENTS.md`) | `.aider.conf.yml` → `.mcp.json` |
+| Gemini CLI | `GEMINI.md` | `~/.gemini/settings.json` |
+| Any AGENTS.md harness | `AGENTS.md` (repo root) | — |
+
 ## Design
 
 Free42's core is layered with two seams that make the port tractable:

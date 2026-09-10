@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "array42": {
+      "command": "zig/zig-out/bin/array42-mcp"
+    }
+  }
+}

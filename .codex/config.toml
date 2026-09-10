@@ -1,0 +1,4 @@
+# Array42 — exact-decimal calculator (MCP server)
+# Project-local Codex config. Build the binary first: `zig build` (in zig/).
+[mcp_servers.array42]
+command = "zig/zig-out/bin/array42-mcp"

@@ -1,0 +1,3 @@
+# Array42 — exact-decimal calculator (MCP server)
+# Aider reads the same JSON MCP config Claude Code uses.
+mcp-config: .mcp.json
