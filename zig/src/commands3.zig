@@ -5,6 +5,10 @@
 //! CROSS) and `core_commands4.cc` (INVRT, TRANS). The heavy lifting is done by
 //! `linalg.zig`; these commands are the thin stack-facing wrappers.
 //!
+//! Arrays use the DB48X-grade nested representation: a matrix is an array of
+//! arrays (rows), a vector is an array of scalars, and arrays nest to
+//! arbitrary depth.
+//!
 //! Deferred (depend on the unported variable system): SIZE, DIM, SIMQ.
 //! FNORM is a DB48X command (not in Free42) and lands in step 4b.
 
@@ -47,6 +51,22 @@ fn clampInf(r: phloat.Phloat, out: *phloat.Phloat) Err {
     return .out_of_range;
 }
 
+/// True if a value contains a complex at any depth.
+fn containsComplex(v: *const Vartype) bool {
+    return switch (v.*) {
+        .complex => true,
+        .array => |a| {
+            for (a.data) |item| {
+                if (item) |p| {
+                    if (containsComplex(p)) return true;
+                }
+            }
+            return false;
+        },
+        else => false,
+    };
+}
+
 // ---------------------------------------------------------------------------
 // DET — determinant
 // ---------------------------------------------------------------------------
@@ -79,155 +99,127 @@ pub fn docmdInvrt(arg: ?*const Arg) Err {
 
 pub fn docmdTrans(arg: ?*const Arg) Err {
     _ = arg;
-    switch (x().*) {
-        .realmatrix => |src| {
-            const rows = src.rows;
-            const columns = src.columns;
-            const dst = vartype.newRealMatrix(columns, rows) orelse return .insufficient_memory;
-            errdefer vartype.free(dst);
-            var i: i32 = 0;
-            while (i < rows) : (i += 1) {
-                var j: i32 = 0;
-                while (j < columns) : (j += 1) {
-                    const n1: usize = @intCast(i * columns + j);
-                    const n2: usize = @intCast(j * rows + i);
-                    dst.realmatrix.is_string[n2] = src.is_string[n1];
-                    dst.realmatrix.data[n2] = src.data[n1];
-                }
-            }
-            helpers.unaryResult(dst);
-            return .none;
-        },
-        .complexmatrix => |src| {
-            const rows = src.rows;
-            const columns = src.columns;
-            const dst = vartype.newComplexMatrix(columns, rows) orelse return .insufficient_memory;
-            errdefer vartype.free(dst);
-            var i: i32 = 0;
-            while (i < rows) : (i += 1) {
-                var j: i32 = 0;
-                while (j < columns) : (j += 1) {
-                    const n1: usize = @intCast(2 * (i * columns + j));
-                    const n2: usize = @intCast(2 * (j * rows + i));
-                    dst.complexmatrix.data[n2] = src.data[n1];
-                    dst.complexmatrix.data[n2 + 1] = src.data[n1 + 1];
-                }
-            }
-            helpers.unaryResult(dst);
-            return .none;
-        },
-        else => return .invalid_type,
+    const info = vartype.matrixInfo(x()) orelse return .invalid_type;
+    const rows = info.rows;
+    const columns = info.columns;
+    const src = x().array;
+    const dst = vartype.newArray(columns) orelse return .insufficient_memory;
+    errdefer vartype.free(dst);
+    var j: i32 = 0;
+    while (j < columns) : (j += 1) {
+        const row = vartype.newArray(rows) orelse return .insufficient_memory;
+        dst.array.data[@intCast(j)] = row;
+        var i: i32 = 0;
+        while (i < rows) : (i += 1) {
+            const elem = src.data[@intCast(i)].?.array.data[@intCast(j)].?;
+            row.array.data[@intCast(i)] = vartype.dup(elem) orelse return .insufficient_memory;
+        }
     }
+    helpers.unaryResult(dst);
+    return .none;
 }
 
 // ---------------------------------------------------------------------------
 // DOT — dot product
 // ---------------------------------------------------------------------------
 
-pub fn docmdDot(arg: ?*const Arg) Err {
-    _ = arg;
-    var v: ?*Vartype = null;
-    if (x().* == .string or y().* == .string) return .alpha_data_is_invalid;
-
-    switch (x().*) {
-        .realmatrix => |rm1| switch (y().*) {
-            .realmatrix => |rm2| {
-                const size = rm1.rows * rm1.columns;
-                if (size != rm2.rows * rm2.columns) return .dimension_error;
-                if (vartype.containsStrings(&rm1) or vartype.containsStrings(&rm2)) return .alpha_data_is_invalid;
-                var dot = phloat.fromInt(0);
-                var i: i32 = 0;
-                while (i < size) : (i += 1) {
-                    dot = phloat.add(dot, phloat.mul(rm1.data[@intCast(i)], rm2.data[@intCast(i)]));
-                }
-                var r: phloat.Phloat = undefined;
-                const e = clampInf(dot, &r);
-                if (e != .none) return e;
-                v = vartype.newReal(r) orelse return .insufficient_memory;
-            },
-            .complexmatrix => |cm| {
-                const size = rm1.rows * rm1.columns;
-                if (size != cm.rows * cm.columns) return .dimension_error;
-                if (vartype.containsStrings(&rm1)) return .alpha_data_is_invalid;
-                var dot_re = phloat.fromInt(0);
-                var dot_im = phloat.fromInt(0);
-                var i: i32 = 0;
-                while (i < size) : (i += 1) {
-                    dot_re = phloat.add(dot_re, phloat.mul(rm1.data[@intCast(i)], cm.data[@intCast(2 * i)]));
-                    dot_im = phloat.add(dot_im, phloat.mul(rm1.data[@intCast(i)], cm.data[@intCast(2 * i + 1)]));
-                }
-                var rre: phloat.Phloat = undefined;
-                var rim: phloat.Phloat = undefined;
-                const e1 = clampInf(dot_re, &rre);
-                if (e1 != .none) return e1;
-                const e2 = clampInf(dot_im, &rim);
-                if (e2 != .none) return e2;
-                v = vartype.newComplex(rre, rim) orelse return .insufficient_memory;
+/// Accumulate the element-wise product of two numeric values into (re, im).
+/// Recurses into arrays; both sides must have the same shape.
+fn dotAccum(a: *const Vartype, b: *const Vartype, re: *phloat.Phloat, im: *phloat.Phloat) Err {
+    switch (a.*) {
+        .real => |av| switch (b.*) {
+            .real => |bv| re.* = phloat.add(re.*, phloat.mul(av, bv)),
+            .complex => |c| {
+                re.* = phloat.add(re.*, phloat.mul(av, c.re));
+                im.* = phloat.add(im.*, phloat.mul(av, c.im));
             },
             else => return .invalid_type,
         },
-        .complexmatrix => |cm1| switch (y().*) {
-            .realmatrix => |rm| {
-                const size = rm.rows * rm.columns;
-                if (size != cm1.rows * cm1.columns) return .dimension_error;
-                if (vartype.containsStrings(&rm)) return .alpha_data_is_invalid;
-                var dot_re = phloat.fromInt(0);
-                var dot_im = phloat.fromInt(0);
-                var i: i32 = 0;
-                while (i < size) : (i += 1) {
-                    dot_re = phloat.add(dot_re, phloat.mul(rm.data[@intCast(i)], cm1.data[@intCast(2 * i)]));
-                    dot_im = phloat.add(dot_im, phloat.mul(rm.data[@intCast(i)], cm1.data[@intCast(2 * i + 1)]));
-                }
-                var rre: phloat.Phloat = undefined;
-                var rim: phloat.Phloat = undefined;
-                const e1 = clampInf(dot_re, &rre);
-                if (e1 != .none) return e1;
-                const e2 = clampInf(dot_im, &rim);
-                if (e2 != .none) return e2;
-                v = vartype.newComplex(rre, rim) orelse return .insufficient_memory;
+        .complex => |c| switch (b.*) {
+            .real => |bv| {
+                re.* = phloat.add(re.*, phloat.mul(c.re, bv));
+                im.* = phloat.add(im.*, phloat.mul(c.im, bv));
             },
-            .complexmatrix => |cm2| {
-                const size = cm1.rows * cm1.columns;
-                if (size != cm2.rows * cm2.columns) return .dimension_error;
-                var dot_re = phloat.fromInt(0);
-                var dot_im = phloat.fromInt(0);
-                var i: i32 = 0;
-                while (i < size) : (i += 1) {
-                    const re1 = cm1.data[@intCast(2 * i)];
-                    const im1 = cm1.data[@intCast(2 * i + 1)];
-                    const re2 = cm2.data[@intCast(2 * i)];
-                    const im2 = cm2.data[@intCast(2 * i + 1)];
-                    dot_re = phloat.add(dot_re, phloat.sub(phloat.mul(re1, re2), phloat.mul(im1, im2)));
-                    dot_im = phloat.add(dot_im, phloat.add(phloat.mul(re1, im2), phloat.mul(re2, im1)));
-                }
-                var rre: phloat.Phloat = undefined;
-                var rim: phloat.Phloat = undefined;
-                const e1 = clampInf(dot_re, &rre);
-                if (e1 != .none) return e1;
-                const e2 = clampInf(dot_im, &rim);
-                if (e2 != .none) return e2;
-                v = vartype.newComplex(rre, rim) orelse return .insufficient_memory;
+            .complex => |c2| {
+                re.* = phloat.add(re.*, phloat.sub(phloat.mul(c.re, c2.re), phloat.mul(c.im, c2.im)));
+                im.* = phloat.add(im.*, phloat.add(phloat.mul(c.re, c2.im), phloat.mul(c2.re, c.im)));
             },
             else => return .invalid_type,
         },
-        .complex => |xc| switch (y().*) {
-            .complex => |yc| {
-                const d = phloat.add(phloat.mul(xc.re, yc.re), phloat.mul(xc.im, yc.im));
-                var r: phloat.Phloat = undefined;
-                const e = clampInf(d, &r);
-                if (e != .none) return e;
-                v = vartype.newReal(r) orelse return .insufficient_memory;
+        .array => |aa| switch (b.*) {
+            .array => |ba| {
+                if (aa.data.len != ba.data.len) return .dimension_error;
+                for (aa.data, 0..) |item, i| {
+                    const p1 = item orelse return .invalid_type;
+                    const p2 = ba.data[i] orelse return .invalid_type;
+                    const e = dotAccum(p1, p2, re, im);
+                    if (e != .none) return e;
+                }
             },
             else => return .invalid_type,
         },
         else => return .invalid_type,
     }
-    return helpers.binaryResult(v.?);
+    return .none;
+}
+
+pub fn docmdDot(arg: ?*const Arg) Err {
+    _ = arg;
+    if (x().* == .string or y().* == .string) return .alpha_data_is_invalid;
+
+    // complex × complex scalar → real dot (re·re + im·im), faithful to Free42.
+    if (x().* == .complex and y().* == .complex) {
+        const xc = x().complex;
+        const yc = y().complex;
+        const d = phloat.add(phloat.mul(xc.re, yc.re), phloat.mul(xc.im, yc.im));
+        var r: phloat.Phloat = undefined;
+        const e = clampInf(d, &r);
+        if (e != .none) return e;
+        const v = vartype.newReal(r) orelse return .insufficient_memory;
+        return helpers.binaryResult(v);
+    }
+
+    // Otherwise both operands must be numeric arrays of the same shape.
+    if (x().* != .array or y().* != .array) return .invalid_type;
+    if (vartype.containsStrings(x()) or vartype.containsStrings(y())) return .alpha_data_is_invalid;
+    var re = phloat.fromInt(0);
+    var im = phloat.fromInt(0);
+    const e = dotAccum(x(), y(), &re, &im);
+    if (e != .none) return e;
+    var rre: phloat.Phloat = undefined;
+    var rim: phloat.Phloat = undefined;
+    const e1 = clampInf(re, &rre);
+    if (e1 != .none) return e1;
+    const e2 = clampInf(im, &rim);
+    if (e2 != .none) return e2;
+    const v = if (containsComplex(x()) or containsComplex(y()))
+        vartype.newComplex(rre, rim)
+    else
+        vartype.newReal(rre);
+    const vv = v orelse return .insufficient_memory;
+    return helpers.binaryResult(vv);
 }
 
 // ---------------------------------------------------------------------------
 // CROSS — cross product
 // ---------------------------------------------------------------------------
+
+/// If `v` is a 1D array of reals, return its length; else null.
+fn realVectorLen(v: *const Vartype) ?i32 {
+    const a = switch (v.*) {
+        .array => |a| a,
+        else => return null,
+    };
+    for (a.data) |item| {
+        const p = item orelse return null;
+        if (p.* != .real) return null;
+    }
+    return @intCast(a.data.len);
+}
+
+fn realVectorElem(v: *const Vartype, i: i32) phloat.Phloat {
+    return v.array.data[@intCast(i)].?.real;
+}
 
 pub fn docmdCross(arg: ?*const Arg) Err {
     _ = arg;
@@ -246,24 +238,23 @@ pub fn docmdCross(arg: ?*const Arg) Err {
             },
             else => return .invalid_type,
         },
-        .realmatrix => |right| switch (y().*) {
-            .realmatrix => |left| {
-                const ls = left.rows * left.columns;
-                const rs = right.rows * right.columns;
+        .array => switch (y().*) {
+            .array => {
+                const ls = realVectorLen(y()) orelse return .invalid_type;
+                const rs = realVectorLen(x()) orelse return .invalid_type;
                 if (ls > 3 or rs > 3) return .dimension_error;
-                if (vartype.containsStrings(&left) or vartype.containsStrings(&right)) return .alpha_data_is_invalid;
                 var xl = phloat.fromInt(0);
                 var yl = phloat.fromInt(0);
                 var zl = phloat.fromInt(0);
                 var xr = phloat.fromInt(0);
                 var yr = phloat.fromInt(0);
                 var zr = phloat.fromInt(0);
-                if (ls >= 1) xl = left.data[0];
-                if (ls >= 2) yl = left.data[1];
-                if (ls >= 3) zl = left.data[2];
-                if (rs >= 1) xr = right.data[0];
-                if (rs >= 2) yr = right.data[1];
-                if (rs >= 3) zr = right.data[2];
+                if (ls >= 1) xl = realVectorElem(y(), 0);
+                if (ls >= 2) yl = realVectorElem(y(), 1);
+                if (ls >= 3) zl = realVectorElem(y(), 2);
+                if (rs >= 1) xr = realVectorElem(x(), 0);
+                if (rs >= 2) yr = realVectorElem(x(), 1);
+                if (rs >= 3) zr = realVectorElem(x(), 2);
                 var xres: phloat.Phloat = undefined;
                 var yres: phloat.Phloat = undefined;
                 var zres: phloat.Phloat = undefined;
@@ -273,11 +264,11 @@ pub fn docmdCross(arg: ?*const Arg) Err {
                 if (e2 != .none) return e2;
                 const e3 = clampInf(phloat.sub(phloat.mul(xl, yr), phloat.mul(yl, xr)), &zres);
                 if (e3 != .none) return e3;
-                const res = vartype.newRealMatrix(1, 3) orelse return .insufficient_memory;
+                const res = vartype.newArray(3) orelse return .insufficient_memory;
                 errdefer vartype.free(res);
-                res.realmatrix.data[0] = xres;
-                res.realmatrix.data[1] = yres;
-                res.realmatrix.data[2] = zres;
+                res.array.data[0] = vartype.newReal(xres) orelse return .insufficient_memory;
+                res.array.data[1] = vartype.newReal(yres) orelse return .insufficient_memory;
+                res.array.data[2] = vartype.newReal(zres) orelse return .insufficient_memory;
                 return helpers.binaryResult(res);
             },
             else => return .invalid_type,
@@ -304,7 +295,17 @@ pub fn docmdNewmat(arg: ?*const Arg) Err {
     _ = arg;
     const xx = toMatrixDim(x().real) orelse return .dimension_error;
     const yy = toMatrixDim(y().real) orelse return .dimension_error;
-    const m = vartype.newRealMatrix(yy, xx) orelse return .insufficient_memory;
+    const m = vartype.newArray(yy) orelse return .insufficient_memory;
+    errdefer vartype.free(m);
+    var i: i32 = 0;
+    while (i < yy) : (i += 1) {
+        const row = vartype.newArray(xx) orelse return .insufficient_memory;
+        m.array.data[@intCast(i)] = row;
+        var j: i32 = 0;
+        while (j < xx) : (j += 1) {
+            row.array.data[@intCast(j)] = vartype.newReal(phloat.fromInt(0)) orelse return .insufficient_memory;
+        }
+    }
     return helpers.binaryResult(m);
 }
 
@@ -314,19 +315,10 @@ pub fn docmdNewmat(arg: ?*const Arg) Err {
 
 pub fn docmdDimT(arg: ?*const Arg) Err {
     _ = arg;
-    const rows: i32 = switch (x().*) {
-        .realmatrix => |m| m.rows,
-        .complexmatrix => |m| m.rows,
-        else => return .invalid_type,
-    };
-    const columns: i32 = switch (x().*) {
-        .realmatrix => |m| m.columns,
-        .complexmatrix => |m| m.columns,
-        else => return .invalid_type,
-    };
-    const new_y = vartype.newReal(phloat.fromInt(rows)) orelse return .insufficient_memory;
+    const info = vartype.matrixInfo(x()) orelse return .invalid_type;
+    const new_y = vartype.newReal(phloat.fromInt(info.rows)) orelse return .insufficient_memory;
     errdefer vartype.free(new_y);
-    const new_x = vartype.newReal(phloat.fromInt(columns)) orelse return .insufficient_memory;
+    const new_x = vartype.newReal(phloat.fromInt(info.columns)) orelse return .insufficient_memory;
     return helpers.unaryTwoResults(new_x, new_y);
 }
 
@@ -338,12 +330,45 @@ fn expectPhloat(expected: f64, p: phloat.Phloat) !void {
     try std.testing.expectApproxEqAbs(expected, phloat.toDouble(p), 1e-20);
 }
 
-/// Put a real matrix on the stack at X (replacing whatever is there).
-fn setXMatrix(rows: i32, cols: i32, values: []const f64) void {
-    const m = vartype.newRealMatrix(rows, cols) orelse unreachable;
-    for (values, 0..) |v, i| m.realmatrix.data[i] = phloat.fromDouble(v);
+/// Read element (i, j) of a real matrix (array of arrays).
+fn matElem(m: *const Vartype, i: i32, j: i32) phloat.Phloat {
+    return m.array.data[@intCast(i)].?.array.data[@intCast(j)].?.real;
+}
+
+/// Build a real matrix (array of arrays) from row-major values.
+fn makeMatrix(rows: i32, cols: i32, values: []const f64) *Vartype {
+    const m = vartype.newArray(rows) orelse unreachable;
+    var i: i32 = 0;
+    while (i < rows) : (i += 1) {
+        const row = vartype.newArray(cols) orelse unreachable;
+        m.array.data[@intCast(i)] = row;
+        var j: i32 = 0;
+        while (j < cols) : (j += 1) {
+            row.array.data[@intCast(j)] = vartype.newReal(phloat.fromDouble(values[@intCast(i * cols + j)])) orelse unreachable;
+        }
+    }
+    return m;
+}
+
+/// Build a real vector (1D array) from values.
+fn makeVector(values: []const f64) *Vartype {
+    const v = vartype.newArray(@intCast(values.len)) orelse unreachable;
+    for (values, 0..) |val, i| {
+        v.array.data[i] = vartype.newReal(phloat.fromDouble(val)) orelse unreachable;
+    }
+    return v;
+}
+
+/// Replace the X register with `m`.
+fn setX(m: *Vartype) void {
     vartype.freeOpt(globals.stack[helpers.xIndex()]);
     globals.stack[helpers.xIndex()] = m;
+}
+
+/// Replace the Y register with `m`.
+fn setY(m: *Vartype) void {
+    vartype.freeOpt(globals.stack[helpers.xIndex() - 1]);
+    globals.stack[helpers.xIndex() - 1] = m;
 }
 
 test "NEWMAT creates a zero matrix and DIM? reports its shape" {
@@ -354,9 +379,9 @@ test "NEWMAT creates a zero matrix and DIM? reports its shape" {
     try std.testing.expectEqual(Err.none, commands1.docmdEnter(null));
     try std.testing.expectEqual(Err.none, commands1.pushNumber("3"));
     try std.testing.expectEqual(Err.none, docmdNewmat(null));
-    try std.testing.expectEqual(vartype.Type.realmatrix, std.meta.activeTag(x().*));
-    try std.testing.expectEqual(@as(i32, 2), x().realmatrix.rows);
-    try std.testing.expectEqual(@as(i32, 3), x().realmatrix.columns);
+    try std.testing.expectEqual(vartype.Type.array, std.meta.activeTag(x().*));
+    try std.testing.expectEqual(@as(usize, 2), x().array.data.len);
+    try std.testing.expectEqual(@as(usize, 3), x().array.data[0].?.array.data.len);
 
     // DIM? → Y = rows (2), X = columns (3).
     try std.testing.expectEqual(Err.none, docmdDimT(null));
@@ -368,23 +393,23 @@ test "TRANS transposes a matrix" {
     globals.init();
     defer globals.deinit();
     // [[1,2,3],[4,5,6]] → transpose [[1,4],[2,5],[3,6]].
-    setXMatrix(2, 3, &.{ 1, 2, 3, 4, 5, 6 });
+    setX(makeMatrix(2, 3, &.{ 1, 2, 3, 4, 5, 6 }));
     try std.testing.expectEqual(Err.none, docmdTrans(null));
-    try std.testing.expectEqual(@as(i32, 3), x().realmatrix.rows);
-    try std.testing.expectEqual(@as(i32, 2), x().realmatrix.columns);
-    try expectPhloat(1, x().realmatrix.data[0]);
-    try expectPhloat(4, x().realmatrix.data[1]);
-    try expectPhloat(2, x().realmatrix.data[2]);
-    try expectPhloat(5, x().realmatrix.data[3]);
-    try expectPhloat(3, x().realmatrix.data[4]);
-    try expectPhloat(6, x().realmatrix.data[5]);
+    try std.testing.expectEqual(@as(usize, 3), x().array.data.len);
+    try std.testing.expectEqual(@as(usize, 2), x().array.data[0].?.array.data.len);
+    try expectPhloat(1, matElem(x(), 0, 0));
+    try expectPhloat(4, matElem(x(), 0, 1));
+    try expectPhloat(2, matElem(x(), 1, 0));
+    try expectPhloat(5, matElem(x(), 1, 1));
+    try expectPhloat(3, matElem(x(), 2, 0));
+    try expectPhloat(6, matElem(x(), 2, 1));
 }
 
 test "DET computes a determinant" {
     globals.init();
     defer globals.deinit();
     // [[2,0],[0,3]] → det 6.
-    setXMatrix(2, 2, &.{ 2, 0, 0, 3 });
+    setX(makeMatrix(2, 2, &.{ 2, 0, 0, 3 }));
     try std.testing.expectEqual(Err.none, docmdDet(null));
     try expectPhloat(6, x().real);
 }
@@ -393,25 +418,20 @@ test "INVRT inverts a matrix" {
     globals.init();
     defer globals.deinit();
     // [[2,0],[0,4]] → inverse [[0.5,0],[0,0.25]].
-    setXMatrix(2, 2, &.{ 2, 0, 0, 4 });
+    setX(makeMatrix(2, 2, &.{ 2, 0, 0, 4 }));
     try std.testing.expectEqual(Err.none, docmdInvrt(null));
-    try expectPhloat(0.5, x().realmatrix.data[0]);
-    try expectPhloat(0, x().realmatrix.data[1]);
-    try expectPhloat(0, x().realmatrix.data[2]);
-    try expectPhloat(0.25, x().realmatrix.data[3]);
+    try expectPhloat(0.5, matElem(x(), 0, 0));
+    try expectPhloat(0, matElem(x(), 0, 1));
+    try expectPhloat(0, matElem(x(), 1, 0));
+    try expectPhloat(0.25, matElem(x(), 1, 1));
 }
 
 test "DOT computes a dot product" {
     globals.init();
     defer globals.deinit();
     // [1,2,3] DOT [4,5,6] = 32.
-    setXMatrix(1, 3, &.{ 4, 5, 6 });
-    const m = vartype.newRealMatrix(1, 3) orelse unreachable;
-    m.realmatrix.data[0] = phloat.fromInt(1);
-    m.realmatrix.data[1] = phloat.fromInt(2);
-    m.realmatrix.data[2] = phloat.fromInt(3);
-    vartype.freeOpt(globals.stack[helpers.xIndex() - 1]);
-    globals.stack[helpers.xIndex() - 1] = m;
+    setX(makeVector(&.{ 4, 5, 6 }));
+    setY(makeVector(&.{ 1, 2, 3 }));
     try std.testing.expectEqual(Err.none, docmdDot(null));
     try expectPhloat(32, x().real);
 }
@@ -420,15 +440,10 @@ test "CROSS computes a cross product" {
     globals.init();
     defer globals.deinit();
     // [1,0,0] × [0,1,0] = [0,0,1].
-    setXMatrix(1, 3, &.{ 0, 1, 0 });
-    const m = vartype.newRealMatrix(1, 3) orelse unreachable;
-    m.realmatrix.data[0] = phloat.fromInt(1);
-    m.realmatrix.data[1] = phloat.fromInt(0);
-    m.realmatrix.data[2] = phloat.fromInt(0);
-    vartype.freeOpt(globals.stack[helpers.xIndex() - 1]);
-    globals.stack[helpers.xIndex() - 1] = m;
+    setX(makeVector(&.{ 0, 1, 0 }));
+    setY(makeVector(&.{ 1, 0, 0 }));
     try std.testing.expectEqual(Err.none, docmdCross(null));
-    try expectPhloat(0, x().realmatrix.data[0]);
-    try expectPhloat(0, x().realmatrix.data[1]);
-    try expectPhloat(1, x().realmatrix.data[2]);
+    try expectPhloat(0, x().array.data[0].?.real);
+    try expectPhloat(0, x().array.data[1].?.real);
+    try expectPhloat(1, x().array.data[2].?.real);
 }

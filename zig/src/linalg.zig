@@ -10,9 +10,11 @@
 //! so this port drops that machinery entirely and computes directly, returning
 //! `Err` on failure.
 //!
-//! Storage matches the C++ original: real matrices are row-major `data[i*n+j]`;
-//! complex matrices are interleaved (re, im) pairs, `data[2*(i*n+j)]` = re and
-//! `data[2*(i*n+j)+1]` = im.
+//! The public entry points take the DB48X-grade nested-array `Vartype` (a
+//! matrix is an array of arrays) and extract a flat row-major buffer for the
+//! LU core, then rebuild the nested array on the way out. Real matrices are
+//! `data[i*n+j]`; complex matrices are interleaved (re, im) pairs,
+//! `data[2*(i*n+j)]` = re and `data[2*(i*n+j)+1]` = im.
 
 const std = @import("std");
 const phloat = @import("phloat.zig");
@@ -21,10 +23,23 @@ const globals = @import("globals.zig");
 
 const Err = globals.Err;
 const Vartype = vartype.Vartype;
-const RealMatrix = vartype.RealMatrix;
-const ComplexMatrix = vartype.ComplexMatrix;
 
 const alloc = std.heap.c_allocator;
+
+/// Flat real matrix (row-major). Private working representation for the LU
+/// core; the public surface is the nested-array `Vartype`.
+const RealMatrix = struct {
+    rows: i32,
+    columns: i32,
+    data: []phloat.Phloat,
+};
+
+/// Flat complex matrix (interleaved re/im). Private working representation.
+const ComplexMatrix = struct {
+    rows: i32,
+    columns: i32,
+    data: []phloat.Phloat,
+};
 
 // ---------------------------------------------------------------------------
 // Local helpers
@@ -84,6 +99,90 @@ fn tinyPivot(scale: phloat.Phloat) phloat.Phloat {
     if (phloat.isZero(scale)) return tiniest;
     const tiny = phloat.pow(phloat.fromInt(10), phloat.sub(phloat.floor(phloat.log10(scale)), phloat.fromInt(20)));
     return if (phloat.lt(tiny, tiniest)) tiniest else tiny;
+}
+
+// ---------------------------------------------------------------------------
+// Nested-array ↔ flat-buffer conversion
+// ---------------------------------------------------------------------------
+
+/// Extract a real matrix (2D all-real numeric array) into a flat buffer.
+/// Returns null if `v` is not a real matrix or on allocation failure.
+fn extractReal(v: *const Vartype) ?RealMatrix {
+    const info = vartype.matrixInfo(v) orelse return null;
+    if (info.is_complex) return null;
+    const a = v.array;
+    const data = alloc.alloc(phloat.Phloat, @intCast(info.rows * info.columns)) catch return null;
+    var i: i32 = 0;
+    while (i < info.rows) : (i += 1) {
+        const row = a.data[@intCast(i)].?.array;
+        var j: i32 = 0;
+        while (j < info.columns) : (j += 1) {
+            data[@intCast(i * info.columns + j)] = row.data[@intCast(j)].?.real;
+        }
+    }
+    return .{ .rows = info.rows, .columns = info.columns, .data = data };
+}
+
+/// Extract a complex matrix (2D numeric array, any complex) into a flat
+/// interleaved buffer. Returns null if `v` is not a matrix or on allocation
+/// failure.
+fn extractComplex(v: *const Vartype) ?ComplexMatrix {
+    const info = vartype.matrixInfo(v) orelse return null;
+    const a = v.array;
+    const data = alloc.alloc(phloat.Phloat, @intCast(2 * info.rows * info.columns)) catch return null;
+    var i: i32 = 0;
+    while (i < info.rows) : (i += 1) {
+        const row = a.data[@intCast(i)].?.array;
+        var j: i32 = 0;
+        while (j < info.columns) : (j += 1) {
+            const elem = row.data[@intCast(j)].?;
+            switch (elem.*) {
+                .real => |x| {
+                    data[@intCast(2 * (i * info.columns + j))] = x;
+                    data[@intCast(2 * (i * info.columns + j) + 1)] = phloat.fromInt(0);
+                },
+                .complex => |c| {
+                    data[@intCast(2 * (i * info.columns + j))] = c.re;
+                    data[@intCast(2 * (i * info.columns + j) + 1)] = c.im;
+                },
+                else => unreachable,
+            }
+        }
+    }
+    return .{ .rows = info.rows, .columns = info.columns, .data = data };
+}
+
+/// Rebuild a nested array (array of arrays of reals) from a flat real matrix.
+fn rebuildReal(m: RealMatrix) ?*Vartype {
+    const a = vartype.newArray(m.rows) orelse return null;
+    errdefer vartype.free(a);
+    var i: i32 = 0;
+    while (i < m.rows) : (i += 1) {
+        const row = vartype.newArray(m.columns) orelse return null;
+        a.array.data[@intCast(i)] = row;
+        var j: i32 = 0;
+        while (j < m.columns) : (j += 1) {
+            row.array.data[@intCast(j)] = vartype.newReal(m.data[@intCast(i * m.columns + j)]) orelse return null;
+        }
+    }
+    return a;
+}
+
+/// Rebuild a nested array (array of arrays of complexes) from a flat complex
+/// matrix.
+fn rebuildComplex(m: ComplexMatrix) ?*Vartype {
+    const a = vartype.newArray(m.rows) orelse return null;
+    errdefer vartype.free(a);
+    var i: i32 = 0;
+    while (i < m.rows) : (i += 1) {
+        const row = vartype.newArray(m.columns) orelse return null;
+        a.array.data[@intCast(i)] = row;
+        var j: i32 = 0;
+        while (j < m.columns) : (j += 1) {
+            row.array.data[@intCast(j)] = vartype.newComplex(m.data[@intCast(2 * (i * m.columns + j))], m.data[@intCast(2 * (i * m.columns + j) + 1)]) orelse return null;
+        }
+    }
+    return a;
 }
 
 // ---------------------------------------------------------------------------
@@ -452,15 +551,13 @@ pub fn luBacksubstCC(a: *const ComplexMatrix, perm: []const i32, b: *ComplexMatr
 
 fn matrixMulRR(left: *const RealMatrix, right: *const RealMatrix, result: *?*Vartype) Err {
     if (left.columns != right.rows) return .dimension_error;
-    if (vartype.containsStrings(left) or vartype.containsStrings(right)) return .alpha_data_is_invalid;
     const m = left.rows;
     const n = right.columns;
     const q = left.columns;
-    const res = vartype.newRealMatrix(m, n) orelse return .insufficient_memory;
-    errdefer vartype.free(res);
+    const data = alloc.alloc(phloat.Phloat, @intCast(m * n)) catch return .insufficient_memory;
+    defer alloc.free(data);
     const l = left.data;
     const r = right.data;
-    const p = res.realmatrix.data;
     var i: i32 = 0;
     while (i < m) : (i += 1) {
         var j: i32 = 0;
@@ -470,25 +567,23 @@ fn matrixMulRR(left: *const RealMatrix, right: *const RealMatrix, result: *?*Var
             while (k < q) : (k += 1) {
                 sum = phloat.add(sum, phloat.mul(l[@intCast(i * q + k)], r[@intCast(k * n + j)]));
             }
-            const e = clampInf(sum, &p[@intCast(i * n + j)]);
+            const e = clampInf(sum, &data[@intCast(i * n + j)]);
             if (e != .none) return e;
         }
     }
-    result.* = res;
+    result.* = rebuildReal(.{ .rows = m, .columns = n, .data = data }) orelse return .insufficient_memory;
     return .none;
 }
 
 fn matrixMulRC(left: *const RealMatrix, right: *const ComplexMatrix, result: *?*Vartype) Err {
     if (left.columns != right.rows) return .dimension_error;
-    if (vartype.containsStrings(left)) return .alpha_data_is_invalid;
     const m = left.rows;
     const n = right.columns;
     const q = left.columns;
-    const res = vartype.newComplexMatrix(m, n) orelse return .insufficient_memory;
-    errdefer vartype.free(res);
+    const data = alloc.alloc(phloat.Phloat, @intCast(2 * m * n)) catch return .insufficient_memory;
+    defer alloc.free(data);
     const l = left.data;
     const r = right.data;
-    const p = res.complexmatrix.data;
     var i: i32 = 0;
     while (i < m) : (i += 1) {
         var j: i32 = 0;
@@ -501,27 +596,25 @@ fn matrixMulRC(left: *const RealMatrix, right: *const ComplexMatrix, result: *?*
                 sum_re = phloat.add(sum_re, phloat.mul(tmp, r[@intCast(2 * (k * n + j))]));
                 sum_im = phloat.add(sum_im, phloat.mul(tmp, r[@intCast(2 * (k * n + j) + 1)]));
             }
-            const e1 = clampInf(sum_re, &p[@intCast(2 * (i * n + j))]);
+            const e1 = clampInf(sum_re, &data[@intCast(2 * (i * n + j))]);
             if (e1 != .none) return e1;
-            const e2 = clampInf(sum_im, &p[@intCast(2 * (i * n + j) + 1)]);
+            const e2 = clampInf(sum_im, &data[@intCast(2 * (i * n + j) + 1)]);
             if (e2 != .none) return e2;
         }
     }
-    result.* = res;
+    result.* = rebuildComplex(.{ .rows = m, .columns = n, .data = data }) orelse return .insufficient_memory;
     return .none;
 }
 
 fn matrixMulCR(left: *const ComplexMatrix, right: *const RealMatrix, result: *?*Vartype) Err {
     if (left.columns != right.rows) return .dimension_error;
-    if (vartype.containsStrings(right)) return .alpha_data_is_invalid;
     const m = left.rows;
     const n = right.columns;
     const q = left.columns;
-    const res = vartype.newComplexMatrix(m, n) orelse return .insufficient_memory;
-    errdefer vartype.free(res);
+    const data = alloc.alloc(phloat.Phloat, @intCast(2 * m * n)) catch return .insufficient_memory;
+    defer alloc.free(data);
     const l = left.data;
     const r = right.data;
-    const p = res.complexmatrix.data;
     var i: i32 = 0;
     while (i < m) : (i += 1) {
         var j: i32 = 0;
@@ -534,13 +627,13 @@ fn matrixMulCR(left: *const ComplexMatrix, right: *const RealMatrix, result: *?*
                 sum_re = phloat.add(sum_re, phloat.mul(tmp, l[@intCast(2 * (i * q + k))]));
                 sum_im = phloat.add(sum_im, phloat.mul(tmp, l[@intCast(2 * (i * q + k) + 1)]));
             }
-            const e1 = clampInf(sum_re, &p[@intCast(2 * (i * n + j))]);
+            const e1 = clampInf(sum_re, &data[@intCast(2 * (i * n + j))]);
             if (e1 != .none) return e1;
-            const e2 = clampInf(sum_im, &p[@intCast(2 * (i * n + j) + 1)]);
+            const e2 = clampInf(sum_im, &data[@intCast(2 * (i * n + j) + 1)]);
             if (e2 != .none) return e2;
         }
     }
-    result.* = res;
+    result.* = rebuildComplex(.{ .rows = m, .columns = n, .data = data }) orelse return .insufficient_memory;
     return .none;
 }
 
@@ -549,11 +642,10 @@ fn matrixMulCC(left: *const ComplexMatrix, right: *const ComplexMatrix, result: 
     const m = left.rows;
     const n = right.columns;
     const q = left.columns;
-    const res = vartype.newComplexMatrix(m, n) orelse return .insufficient_memory;
-    errdefer vartype.free(res);
+    const data = alloc.alloc(phloat.Phloat, @intCast(2 * m * n)) catch return .insufficient_memory;
+    defer alloc.free(data);
     const l = left.data;
     const r = right.data;
-    const p = res.complexmatrix.data;
     var i: i32 = 0;
     while (i < m) : (i += 1) {
         var j: i32 = 0;
@@ -569,13 +661,13 @@ fn matrixMulCC(left: *const ComplexMatrix, right: *const ComplexMatrix, result: 
                 sum_re = phloat.add(sum_re, phloat.sub(phloat.mul(l_re, r_re), phloat.mul(l_im, r_im)));
                 sum_im = phloat.add(sum_im, phloat.add(phloat.mul(l_im, r_re), phloat.mul(l_re, r_im)));
             }
-            const e1 = clampInf(sum_re, &p[@intCast(2 * (i * n + j))]);
+            const e1 = clampInf(sum_re, &data[@intCast(2 * (i * n + j))]);
             if (e1 != .none) return e1;
-            const e2 = clampInf(sum_im, &p[@intCast(2 * (i * n + j) + 1)]);
+            const e2 = clampInf(sum_im, &data[@intCast(2 * (i * n + j) + 1)]);
             if (e2 != .none) return e2;
         }
     }
-    result.* = res;
+    result.* = rebuildComplex(.{ .rows = m, .columns = n, .data = data }) orelse return .insufficient_memory;
     return .none;
 }
 
@@ -583,253 +675,231 @@ fn matrixMulCC(left: *const ComplexMatrix, right: *const ComplexMatrix, result: 
 // High-level entry points
 // ---------------------------------------------------------------------------
 
-/// Matrix-matrix multiplication. Both operands must be matrices (real or
-/// complex); the result type follows the usual real/complex promotion rules.
+/// Matrix-matrix multiplication. Both operands must be matrices (2D numeric
+/// arrays); the result type follows the usual real/complex promotion rules.
 pub fn linalgMul(left: *const Vartype, right: *const Vartype, result: *?*Vartype) Err {
-    switch (left.*) {
-        .realmatrix => |lm| switch (right.*) {
-            .realmatrix => |rm| return matrixMulRR(&lm, &rm, result),
-            .complexmatrix => |rm| return matrixMulRC(&lm, &rm, result),
-            else => return .invalid_type,
-        },
-        .complexmatrix => |lm| switch (right.*) {
-            .realmatrix => |rm| return matrixMulCR(&lm, &rm, result),
-            .complexmatrix => |rm| return matrixMulCC(&lm, &rm, result),
-            else => return .invalid_type,
-        },
-        else => return .invalid_type,
+    const li = vartype.matrixInfo(left) orelse return .invalid_type;
+    const ri = vartype.matrixInfo(right) orelse return .invalid_type;
+    if (vartype.containsStrings(left) or vartype.containsStrings(right)) return .alpha_data_is_invalid;
+    if (!li.is_complex and !ri.is_complex) {
+        const lm = extractReal(left) orelse return .insufficient_memory;
+        defer alloc.free(lm.data);
+        const rm = extractReal(right) orelse return .insufficient_memory;
+        defer alloc.free(rm.data);
+        return matrixMulRR(&lm, &rm, result);
+    } else if (!li.is_complex and ri.is_complex) {
+        const lm = extractReal(left) orelse return .insufficient_memory;
+        defer alloc.free(lm.data);
+        const rm = extractComplex(right) orelse return .insufficient_memory;
+        defer alloc.free(rm.data);
+        return matrixMulRC(&lm, &rm, result);
+    } else if (li.is_complex and !ri.is_complex) {
+        const lm = extractComplex(left) orelse return .insufficient_memory;
+        defer alloc.free(lm.data);
+        const rm = extractReal(right) orelse return .insufficient_memory;
+        defer alloc.free(rm.data);
+        return matrixMulCR(&lm, &rm, result);
+    } else {
+        const lm = extractComplex(left) orelse return .insufficient_memory;
+        defer alloc.free(lm.data);
+        const rm = extractComplex(right) orelse return .insufficient_memory;
+        defer alloc.free(rm.data);
+        return matrixMulCC(&lm, &rm, result);
     }
 }
 
 /// Matrix-matrix division: `left / right` = `left * right^-1`, computed by LU
 /// decomposition of `right` followed by back-substitution of `left`.
 pub fn linalgDiv(left: *const Vartype, right: *const Vartype, result: *?*Vartype) Err {
-    switch (left.*) {
-        .realmatrix => |num| switch (right.*) {
-            .realmatrix => |denom| {
-                const rows = num.rows;
-                const columns = num.columns;
-                if (denom.rows != rows or denom.columns != rows) return .dimension_error;
-                const perm = alloc.alloc(i32, @intCast(rows)) catch return .insufficient_memory;
-                defer alloc.free(perm);
-                const lu = vartype.newRealMatrix(rows, rows) orelse return .insufficient_memory;
-                defer vartype.free(lu);
-                @memcpy(lu.realmatrix.data, denom.data);
-                @memcpy(lu.realmatrix.is_string, denom.is_string);
-                var det: phloat.Phloat = undefined;
-                const e = luDecompR(&lu.realmatrix, perm, &det);
-                if (e != .none) return e;
-                const res = vartype.newRealMatrix(rows, columns) orelse return .insufficient_memory;
-                errdefer vartype.free(res);
-                @memcpy(res.realmatrix.data, num.data);
-                @memcpy(res.realmatrix.is_string, num.is_string);
-                const e2 = luBacksubstRR(&lu.realmatrix, perm, &res.realmatrix);
-                if (e2 != .none) return e2;
-                result.* = res;
-                return .none;
-            },
-            .complexmatrix => |denom| {
-                const rows = num.rows;
-                const columns = num.columns;
-                if (denom.rows != rows or denom.columns != rows) return .dimension_error;
-                const perm = alloc.alloc(i32, @intCast(rows)) catch return .insufficient_memory;
-                defer alloc.free(perm);
-                const lu = vartype.newComplexMatrix(rows, rows) orelse return .insufficient_memory;
-                defer vartype.free(lu);
-                @memcpy(lu.complexmatrix.data, denom.data);
-                var det_re: phloat.Phloat = undefined;
-                var det_im: phloat.Phloat = undefined;
-                const e = luDecompC(&lu.complexmatrix, perm, &det_re, &det_im);
-                if (e != .none) return e;
-                const res = vartype.newComplexMatrix(rows, columns) orelse return .insufficient_memory;
-                errdefer vartype.free(res);
-                @memcpy(res.complexmatrix.data, num.data);
-                const e2 = luBacksubstCC(&lu.complexmatrix, perm, &res.complexmatrix);
-                if (e2 != .none) return e2;
-                result.* = res;
-                return .none;
-            },
-            else => return .invalid_type,
-        },
-        .complexmatrix => |num| switch (right.*) {
-            .realmatrix => |denom| {
-                const rows = num.rows;
-                const columns = num.columns;
-                if (denom.rows != rows or denom.columns != rows) return .dimension_error;
-                const perm = alloc.alloc(i32, @intCast(rows)) catch return .insufficient_memory;
-                defer alloc.free(perm);
-                const lu = vartype.newRealMatrix(rows, rows) orelse return .insufficient_memory;
-                defer vartype.free(lu);
-                @memcpy(lu.realmatrix.data, denom.data);
-                @memcpy(lu.realmatrix.is_string, denom.is_string);
-                var det: phloat.Phloat = undefined;
-                const e = luDecompR(&lu.realmatrix, perm, &det);
-                if (e != .none) return e;
-                const res = vartype.newComplexMatrix(rows, columns) orelse return .insufficient_memory;
-                errdefer vartype.free(res);
-                @memcpy(res.complexmatrix.data, num.data);
-                const e2 = luBacksubstRC(&lu.realmatrix, perm, &res.complexmatrix);
-                if (e2 != .none) return e2;
-                result.* = res;
-                return .none;
-            },
-            .complexmatrix => |denom| {
-                const rows = num.rows;
-                const columns = num.columns;
-                if (denom.rows != rows or denom.columns != rows) return .dimension_error;
-                const perm = alloc.alloc(i32, @intCast(rows)) catch return .insufficient_memory;
-                defer alloc.free(perm);
-                const lu = vartype.newComplexMatrix(rows, rows) orelse return .insufficient_memory;
-                defer vartype.free(lu);
-                @memcpy(lu.complexmatrix.data, denom.data);
-                var det_re: phloat.Phloat = undefined;
-                var det_im: phloat.Phloat = undefined;
-                const e = luDecompC(&lu.complexmatrix, perm, &det_re, &det_im);
-                if (e != .none) return e;
-                const res = vartype.newComplexMatrix(rows, columns) orelse return .insufficient_memory;
-                errdefer vartype.free(res);
-                @memcpy(res.complexmatrix.data, num.data);
-                const e2 = luBacksubstCC(&lu.complexmatrix, perm, &res.complexmatrix);
-                if (e2 != .none) return e2;
-                result.* = res;
-                return .none;
-            },
-            else => return .invalid_type,
-        },
-        else => return .invalid_type,
+    const li = vartype.matrixInfo(left) orelse return .invalid_type;
+    const ri = vartype.matrixInfo(right) orelse return .invalid_type;
+    if (vartype.containsStrings(left) or vartype.containsStrings(right)) return .alpha_data_is_invalid;
+    const rows = li.rows;
+    const columns = li.columns;
+    if (ri.rows != rows or ri.columns != rows) return .dimension_error;
+    const perm = alloc.alloc(i32, @intCast(rows)) catch return .insufficient_memory;
+    defer alloc.free(perm);
+
+    if (!li.is_complex and !ri.is_complex) {
+        const num = extractReal(left) orelse return .insufficient_memory;
+        defer alloc.free(num.data);
+        var denom = extractReal(right) orelse return .insufficient_memory;
+        defer alloc.free(denom.data);
+        var det: phloat.Phloat = undefined;
+        const e = luDecompR(&denom, perm, &det);
+        if (e != .none) return e;
+        var res = RealMatrix{ .rows = rows, .columns = columns, .data = alloc.alloc(phloat.Phloat, @intCast(rows * columns)) catch return .insufficient_memory };
+        defer alloc.free(res.data);
+        @memcpy(res.data, num.data);
+        const e2 = luBacksubstRR(&denom, perm, &res);
+        if (e2 != .none) return e2;
+        result.* = rebuildReal(res) orelse return .insufficient_memory;
+        return .none;
+    } else if (!li.is_complex and ri.is_complex) {
+        const num = extractReal(left) orelse return .insufficient_memory;
+        defer alloc.free(num.data);
+        var denom = extractComplex(right) orelse return .insufficient_memory;
+        defer alloc.free(denom.data);
+        var det_re: phloat.Phloat = undefined;
+        var det_im: phloat.Phloat = undefined;
+        const e = luDecompC(&denom, perm, &det_re, &det_im);
+        if (e != .none) return e;
+        var res = ComplexMatrix{ .rows = rows, .columns = columns, .data = alloc.alloc(phloat.Phloat, @intCast(2 * rows * columns)) catch return .insufficient_memory };
+        defer alloc.free(res.data);
+        var i: i32 = 0;
+        while (i < rows * columns) : (i += 1) {
+            res.data[@intCast(2 * i)] = num.data[@intCast(i)];
+            res.data[@intCast(2 * i + 1)] = phloat.fromInt(0);
+        }
+        const e2 = luBacksubstCC(&denom, perm, &res);
+        if (e2 != .none) return e2;
+        result.* = rebuildComplex(res) orelse return .insufficient_memory;
+        return .none;
+    } else if (li.is_complex and !ri.is_complex) {
+        const num = extractComplex(left) orelse return .insufficient_memory;
+        defer alloc.free(num.data);
+        var denom = extractReal(right) orelse return .insufficient_memory;
+        defer alloc.free(denom.data);
+        var det: phloat.Phloat = undefined;
+        const e = luDecompR(&denom, perm, &det);
+        if (e != .none) return e;
+        var res = ComplexMatrix{ .rows = rows, .columns = columns, .data = alloc.alloc(phloat.Phloat, @intCast(2 * rows * columns)) catch return .insufficient_memory };
+        defer alloc.free(res.data);
+        @memcpy(res.data, num.data);
+        const e2 = luBacksubstRC(&denom, perm, &res);
+        if (e2 != .none) return e2;
+        result.* = rebuildComplex(res) orelse return .insufficient_memory;
+        return .none;
+    } else {
+        const num = extractComplex(left) orelse return .insufficient_memory;
+        defer alloc.free(num.data);
+        var denom = extractComplex(right) orelse return .insufficient_memory;
+        defer alloc.free(denom.data);
+        var det_re: phloat.Phloat = undefined;
+        var det_im: phloat.Phloat = undefined;
+        const e = luDecompC(&denom, perm, &det_re, &det_im);
+        if (e != .none) return e;
+        var res = ComplexMatrix{ .rows = rows, .columns = columns, .data = alloc.alloc(phloat.Phloat, @intCast(2 * rows * columns)) catch return .insufficient_memory };
+        defer alloc.free(res.data);
+        @memcpy(res.data, num.data);
+        const e2 = luBacksubstCC(&denom, perm, &res);
+        if (e2 != .none) return e2;
+        result.* = rebuildComplex(res) orelse return .insufficient_memory;
+        return .none;
     }
 }
 
 /// Matrix inverse, computed by LU decomposition followed by back-substitution
 /// of the identity matrix.
 pub fn linalgInv(src: *const Vartype, result: *?*Vartype) Err {
-    switch (src.*) {
-        .realmatrix => |ma| {
-            const n = ma.rows;
-            if (n != ma.columns) return .dimension_error;
-            if (vartype.containsStrings(&ma)) return .alpha_data_is_invalid;
-            const perm = alloc.alloc(i32, @intCast(n)) catch return .insufficient_memory;
-            defer alloc.free(perm);
-            const lu = vartype.newRealMatrix(n, n) orelse return .insufficient_memory;
-            defer vartype.free(lu);
-            @memcpy(lu.realmatrix.data, ma.data);
-            @memcpy(lu.realmatrix.is_string, ma.is_string);
-            const inv = vartype.newRealMatrix(n, n) orelse return .insufficient_memory;
-            errdefer vartype.free(inv);
-            var det: phloat.Phloat = undefined;
-            const e = luDecompR(&lu.realmatrix, perm, &det);
-            if (e != .none) return e;
-            var i: i32 = 0;
-            while (i < n) : (i += 1) {
-                inv.realmatrix.data[@intCast(i * (n + 1))] = phloat.fromInt(1);
-            }
-            const e2 = luBacksubstRR(&lu.realmatrix, perm, &inv.realmatrix);
-            if (e2 != .none) return e2;
-            result.* = inv;
-            return .none;
-        },
-        .complexmatrix => |ma| {
-            const n = ma.rows;
-            if (n != ma.columns) return .dimension_error;
-            const perm = alloc.alloc(i32, @intCast(n)) catch return .insufficient_memory;
-            defer alloc.free(perm);
-            const lu = vartype.newComplexMatrix(n, n) orelse return .insufficient_memory;
-            defer vartype.free(lu);
-            @memcpy(lu.complexmatrix.data, ma.data);
-            const inv = vartype.newComplexMatrix(n, n) orelse return .insufficient_memory;
-            errdefer vartype.free(inv);
-            var det_re: phloat.Phloat = undefined;
-            var det_im: phloat.Phloat = undefined;
-            const e = luDecompC(&lu.complexmatrix, perm, &det_re, &det_im);
-            if (e != .none) return e;
-            var i: i32 = 0;
-            while (i < n) : (i += 1) {
-                inv.complexmatrix.data[@intCast(2 * (i * (n + 1)))] = phloat.fromInt(1);
-            }
-            const e2 = luBacksubstCC(&lu.complexmatrix, perm, &inv.complexmatrix);
-            if (e2 != .none) return e2;
-            result.* = inv;
-            return .none;
-        },
-        else => return .invalid_type,
+    const info = vartype.matrixInfo(src) orelse return .invalid_type;
+    if (vartype.containsStrings(src)) return .alpha_data_is_invalid;
+    const n = info.rows;
+    if (n != info.columns) return .dimension_error;
+    const perm = alloc.alloc(i32, @intCast(n)) catch return .insufficient_memory;
+    defer alloc.free(perm);
+
+    if (!info.is_complex) {
+        var ma = extractReal(src) orelse return .insufficient_memory;
+        defer alloc.free(ma.data);
+        var det: phloat.Phloat = undefined;
+        const e = luDecompR(&ma, perm, &det);
+        if (e != .none) return e;
+        var inv = RealMatrix{ .rows = n, .columns = n, .data = alloc.alloc(phloat.Phloat, @intCast(n * n)) catch return .insufficient_memory };
+        defer alloc.free(inv.data);
+        @memset(inv.data, phloat.fromInt(0));
+        var i: i32 = 0;
+        while (i < n) : (i += 1) {
+            inv.data[@intCast(i * (n + 1))] = phloat.fromInt(1);
+        }
+        const e2 = luBacksubstRR(&ma, perm, &inv);
+        if (e2 != .none) return e2;
+        result.* = rebuildReal(inv) orelse return .insufficient_memory;
+        return .none;
+    } else {
+        var ma = extractComplex(src) orelse return .insufficient_memory;
+        defer alloc.free(ma.data);
+        var det_re: phloat.Phloat = undefined;
+        var det_im: phloat.Phloat = undefined;
+        const e = luDecompC(&ma, perm, &det_re, &det_im);
+        if (e != .none) return e;
+        var inv = ComplexMatrix{ .rows = n, .columns = n, .data = alloc.alloc(phloat.Phloat, @intCast(2 * n * n)) catch return .insufficient_memory };
+        defer alloc.free(inv.data);
+        @memset(inv.data, phloat.fromInt(0));
+        var i: i32 = 0;
+        while (i < n) : (i += 1) {
+            inv.data[@intCast(2 * (i * (n + 1)))] = phloat.fromInt(1);
+        }
+        const e2 = luBacksubstCC(&ma, perm, &inv);
+        if (e2 != .none) return e2;
+        result.* = rebuildComplex(inv) orelse return .insufficient_memory;
+        return .none;
     }
 }
 
 /// Matrix determinant. Forces singular-matrix error mode so a zero pivot is
 /// reported (and folded to det = 0) rather than fudged.
 pub fn linalgDet(src: *const Vartype, result: *?*Vartype) Err {
-    switch (src.*) {
-        .realmatrix => |ma| {
-            const n = ma.rows;
-            if (n != ma.columns) return .dimension_error;
-            if (vartype.containsStrings(&ma)) return .alpha_data_is_invalid;
-            const perm = alloc.alloc(i32, @intCast(n)) catch return .insufficient_memory;
-            defer alloc.free(perm);
-            const lu = vartype.newRealMatrix(n, n) orelse return .insufficient_memory;
-            defer vartype.free(lu);
-            @memcpy(lu.realmatrix.data, ma.data);
-            @memcpy(lu.realmatrix.is_string, ma.is_string);
-            const prev = globals.settings.matrix_singularmatrix;
-            globals.settings.matrix_singularmatrix = true;
-            defer globals.settings.matrix_singularmatrix = prev;
-            var det: phloat.Phloat = undefined;
-            const e = luDecompR(&lu.realmatrix, perm, &det);
-            if (e == .singular_matrix) {
-                det = phloat.fromInt(0);
-            } else if (e != .none) {
-                return e;
+    const info = vartype.matrixInfo(src) orelse return .invalid_type;
+    if (vartype.containsStrings(src)) return .alpha_data_is_invalid;
+    const n = info.rows;
+    if (n != info.columns) return .dimension_error;
+    const perm = alloc.alloc(i32, @intCast(n)) catch return .insufficient_memory;
+    defer alloc.free(perm);
+    const prev = globals.settings.matrix_singularmatrix;
+    globals.settings.matrix_singularmatrix = true;
+    defer globals.settings.matrix_singularmatrix = prev;
+
+    if (!info.is_complex) {
+        var ma = extractReal(src) orelse return .insufficient_memory;
+        defer alloc.free(ma.data);
+        var det: phloat.Phloat = undefined;
+        const e = luDecompR(&ma, perm, &det);
+        if (e == .singular_matrix) {
+            det = phloat.fromInt(0);
+        } else if (e != .none) {
+            return e;
+        }
+        const inf = pIsinf(det);
+        if (inf != 0) {
+            if (globals.flags.range_error_ignore) {
+                det = if (inf < 0) phloat.NEG_HUGE else phloat.POS_HUGE;
+            } else {
+                return .out_of_range;
             }
-            const inf = pIsinf(det);
-            if (inf != 0) {
-                if (globals.flags.range_error_ignore) {
-                    det = if (inf < 0) phloat.NEG_HUGE else phloat.POS_HUGE;
-                } else {
-                    return .out_of_range;
-                }
+        }
+        result.* = vartype.newReal(det) orelse return .insufficient_memory;
+        return .none;
+    } else {
+        var ma = extractComplex(src) orelse return .insufficient_memory;
+        defer alloc.free(ma.data);
+        var det_re: phloat.Phloat = undefined;
+        var det_im: phloat.Phloat = undefined;
+        const e = luDecompC(&ma, perm, &det_re, &det_im);
+        if (e == .singular_matrix) {
+            det_re = phloat.fromInt(0);
+            det_im = phloat.fromInt(0);
+        } else if (e != .none) {
+            return e;
+        }
+        var inf = pIsinf(det_re);
+        if (inf != 0) {
+            if (globals.flags.range_error_ignore) {
+                det_re = if (inf < 0) phloat.NEG_HUGE else phloat.POS_HUGE;
+            } else {
+                return .out_of_range;
             }
-            result.* = vartype.newReal(det) orelse return .insufficient_memory;
-            return .none;
-        },
-        .complexmatrix => |ma| {
-            const n = ma.rows;
-            if (n != ma.columns) return .dimension_error;
-            const perm = alloc.alloc(i32, @intCast(n)) catch return .insufficient_memory;
-            defer alloc.free(perm);
-            const lu = vartype.newComplexMatrix(n, n) orelse return .insufficient_memory;
-            defer vartype.free(lu);
-            @memcpy(lu.complexmatrix.data, ma.data);
-            const prev = globals.settings.matrix_singularmatrix;
-            globals.settings.matrix_singularmatrix = true;
-            defer globals.settings.matrix_singularmatrix = prev;
-            var det_re: phloat.Phloat = undefined;
-            var det_im: phloat.Phloat = undefined;
-            const e = luDecompC(&lu.complexmatrix, perm, &det_re, &det_im);
-            if (e == .singular_matrix) {
-                det_re = phloat.fromInt(0);
-                det_im = phloat.fromInt(0);
-            } else if (e != .none) {
-                return e;
+        }
+        inf = pIsinf(det_im);
+        if (inf != 0) {
+            if (globals.flags.range_error_ignore) {
+                det_im = if (inf < 0) phloat.NEG_HUGE else phloat.POS_HUGE;
+            } else {
+                return .out_of_range;
             }
-            var inf = pIsinf(det_re);
-            if (inf != 0) {
-                if (globals.flags.range_error_ignore) {
-                    det_re = if (inf < 0) phloat.NEG_HUGE else phloat.POS_HUGE;
-                } else {
-                    return .out_of_range;
-                }
-            }
-            inf = pIsinf(det_im);
-            if (inf != 0) {
-                if (globals.flags.range_error_ignore) {
-                    det_im = if (inf < 0) phloat.NEG_HUGE else phloat.POS_HUGE;
-                } else {
-                    return .out_of_range;
-                }
-            }
-            result.* = vartype.newComplex(det_re, det_im) orelse return .insufficient_memory;
-            return .none;
-        },
-        else => return .invalid_type,
+        }
+        result.* = vartype.newComplex(det_re, det_im) orelse return .insufficient_memory;
+        return .none;
     }
 }
 
@@ -838,12 +908,21 @@ pub fn linalgDet(src: *const Vartype, result: *?*Vartype) Err {
 // ---------------------------------------------------------------------------
 
 fn makeReal2x2(a: i32, b: i32, c: i32, d: i32) ?*Vartype {
-    const m = vartype.newRealMatrix(2, 2) orelse return null;
-    m.realmatrix.data[0] = phloat.fromInt(a);
-    m.realmatrix.data[1] = phloat.fromInt(b);
-    m.realmatrix.data[2] = phloat.fromInt(c);
-    m.realmatrix.data[3] = phloat.fromInt(d);
+    const m = vartype.newArray(2) orelse return null;
+    const r0 = vartype.newArray(2) orelse return null;
+    const r1 = vartype.newArray(2) orelse return null;
+    m.array.data[0] = r0;
+    m.array.data[1] = r1;
+    r0.array.data[0] = vartype.newReal(phloat.fromInt(a)) orelse return null;
+    r0.array.data[1] = vartype.newReal(phloat.fromInt(b)) orelse return null;
+    r1.array.data[0] = vartype.newReal(phloat.fromInt(c)) orelse return null;
+    r1.array.data[1] = vartype.newReal(phloat.fromInt(d)) orelse return null;
     return m;
+}
+
+/// Read element (i, j) of a real matrix.
+fn matElem(m: *const Vartype, i: i32, j: i32) phloat.Phloat {
+    return m.array.data[@intCast(i)].?.array.data[@intCast(j)].?.real;
 }
 
 /// Compare a phloat against an f64 within a tolerance that absorbs the
@@ -862,10 +941,10 @@ test "matrix multiply 2x2" {
     var r: ?*Vartype = null;
     try std.testing.expectEqual(Err.none, linalgMul(a, b, &r));
     defer vartype.freeOpt(r);
-    try expectPhloat(r.?.realmatrix.data[0], 19.0);
-    try expectPhloat(r.?.realmatrix.data[1], 22.0);
-    try expectPhloat(r.?.realmatrix.data[2], 43.0);
-    try expectPhloat(r.?.realmatrix.data[3], 50.0);
+    try expectPhloat(matElem(r.?, 0, 0), 19.0);
+    try expectPhloat(matElem(r.?, 0, 1), 22.0);
+    try expectPhloat(matElem(r.?, 1, 0), 43.0);
+    try expectPhloat(matElem(r.?, 1, 1), 50.0);
 }
 
 test "matrix determinant 2x2" {
@@ -888,10 +967,10 @@ test "matrix inverse 2x2" {
     try std.testing.expectEqual(Err.none, linalgInv(a, &r));
     defer vartype.freeOpt(r);
     // A^-1 = [[-2, 1], [1.5, -0.5]]
-    try expectPhloat(r.?.realmatrix.data[0], -2.0);
-    try expectPhloat(r.?.realmatrix.data[1], 1.0);
-    try expectPhloat(r.?.realmatrix.data[2], 1.5);
-    try expectPhloat(r.?.realmatrix.data[3], -0.5);
+    try expectPhloat(matElem(r.?, 0, 0), -2.0);
+    try expectPhloat(matElem(r.?, 0, 1), 1.0);
+    try expectPhloat(matElem(r.?, 1, 0), 1.5);
+    try expectPhloat(matElem(r.?, 1, 1), -0.5);
 }
 
 test "matrix solve (division) 2x2" {
@@ -900,15 +979,19 @@ test "matrix solve (division) 2x2" {
     const a = makeReal2x2(1, 2, 3, 4) orelse return error.OOM;
     defer vartype.free(a);
     // b = [[5], [11]]; solve A x = b → x = [[1], [2]]
-    const b = vartype.newRealMatrix(2, 1) orelse return error.OOM;
+    const b = vartype.newArray(2) orelse return error.OOM;
     defer vartype.free(b);
-    b.realmatrix.data[0] = phloat.fromInt(5);
-    b.realmatrix.data[1] = phloat.fromInt(11);
+    const b0 = vartype.newArray(1) orelse return error.OOM;
+    const b1 = vartype.newArray(1) orelse return error.OOM;
+    b.array.data[0] = b0;
+    b.array.data[1] = b1;
+    b0.array.data[0] = vartype.newReal(phloat.fromInt(5)) orelse return error.OOM;
+    b1.array.data[0] = vartype.newReal(phloat.fromInt(11)) orelse return error.OOM;
     var r: ?*Vartype = null;
     try std.testing.expectEqual(Err.none, linalgDiv(b, a, &r));
     defer vartype.freeOpt(r);
-    try expectPhloat(r.?.realmatrix.data[0], 1.0);
-    try expectPhloat(r.?.realmatrix.data[1], 2.0);
+    try expectPhloat(matElem(r.?, 0, 0), 1.0);
+    try expectPhloat(matElem(r.?, 1, 0), 2.0);
 }
 
 test "singular matrix determinant is zero" {

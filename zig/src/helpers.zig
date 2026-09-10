@@ -208,30 +208,21 @@ pub fn mapUnary(src: *const Vartype, dst: *?*Vartype, mr: ?MappableR, mc: ?Mappa
             dst.* = vartype.newComplex(rre, rim) orelse return .insufficient_memory;
             return .none;
         },
-        .realmatrix => |sm| {
-            const m = mr orelse return .internal_error;
-            if (vartype.containsStrings(&sm)) return .alpha_data_is_invalid;
-            const dm = vartype.newRealMatrix(sm.rows, sm.columns) orelse return .insufficient_memory;
-            errdefer vartype.free(dm);
-            for (sm.data, 0..) |x, i| {
-                const e = m(x, &dm.realmatrix.data[i]);
+        .array => |a| {
+            if (vartype.containsStrings(src)) return .alpha_data_is_invalid;
+            const da = vartype.newArray(@intCast(a.data.len)) orelse return .insufficient_memory;
+            errdefer vartype.free(da);
+            for (a.data, 0..) |item, i| {
+                const p = item orelse return .invalid_type;
+                var r: ?*Vartype = null;
+                const e = mapUnary(p, &r, mr, mc);
                 if (e != .none) return e;
+                da.array.data[i] = r;
             }
-            dst.* = dm;
+            dst.* = da;
             return .none;
         },
-        .complexmatrix => |sm| {
-            const m = mc orelse return .internal_error;
-            const dm = vartype.newComplexMatrix(sm.rows, sm.columns) orelse return .insufficient_memory;
-            errdefer vartype.free(dm);
-            var i: usize = 0;
-            while (i < sm.data.len) : (i += 2) {
-                const e = m(sm.data[i], sm.data[i + 1], &dm.complexmatrix.data[i], &dm.complexmatrix.data[i + 1]);
-                if (e != .none) return e;
-            }
-            dst.* = dm;
-            return .none;
-        },
+        .string => return .alpha_data_is_invalid,
         else => return .internal_error,
     }
 }
@@ -254,26 +245,18 @@ pub fn mapBinary(src1: *const Vartype, src2: *const Vartype, dst: *?*Vartype, mr
                 dst.* = vartype.newComplex(rre, rim) orelse return .insufficient_memory;
                 return .none;
             },
-            .realmatrix => |sm| {
-                if (vartype.containsStrings(&sm)) return .alpha_data_is_invalid;
-                const dm = vartype.newRealMatrix(sm.rows, sm.columns) orelse return .insufficient_memory;
-                errdefer vartype.free(dm);
-                for (sm.data, 0..) |y, i| {
-                    const e = mrr(x, y, &dm.realmatrix.data[i]);
+            .array => |a2| {
+                if (vartype.containsStrings(src2)) return .alpha_data_is_invalid;
+                const da = vartype.newArray(@intCast(a2.data.len)) orelse return .insufficient_memory;
+                errdefer vartype.free(da);
+                for (a2.data, 0..) |item, i| {
+                    const p = item orelse return .invalid_type;
+                    var r: ?*Vartype = null;
+                    const e = mapBinary(src1, p, &r, mrr, mrc, mcr, mcc);
                     if (e != .none) return e;
+                    da.array.data[i] = r;
                 }
-                dst.* = dm;
-                return .none;
-            },
-            .complexmatrix => |sm| {
-                const dm = vartype.newComplexMatrix(sm.rows, sm.columns) orelse return .insufficient_memory;
-                errdefer vartype.free(dm);
-                var i: usize = 0;
-                while (i < sm.data.len) : (i += 2) {
-                    const e = mrc(x, sm.data[i], sm.data[i + 1], &dm.complexmatrix.data[i], &dm.complexmatrix.data[i + 1]);
-                    if (e != .none) return e;
-                }
-                dst.* = dm;
+                dst.* = da;
                 return .none;
             },
             else => return .internal_error,
@@ -295,124 +278,51 @@ pub fn mapBinary(src1: *const Vartype, src2: *const Vartype, dst: *?*Vartype, mr
                 dst.* = vartype.newComplex(rre, rim) orelse return .insufficient_memory;
                 return .none;
             },
-            .realmatrix => |sm| {
-                if (vartype.containsStrings(&sm)) return .alpha_data_is_invalid;
-                const dm = vartype.newComplexMatrix(sm.rows, sm.columns) orelse return .insufficient_memory;
-                errdefer vartype.free(dm);
-                for (sm.data, 0..) |y, i| {
-                    const e = mcr(c.re, c.im, y, &dm.complexmatrix.data[2 * i], &dm.complexmatrix.data[2 * i + 1]);
+            .array => |a2| {
+                if (vartype.containsStrings(src2)) return .alpha_data_is_invalid;
+                const da = vartype.newArray(@intCast(a2.data.len)) orelse return .insufficient_memory;
+                errdefer vartype.free(da);
+                for (a2.data, 0..) |item, i| {
+                    const p = item orelse return .invalid_type;
+                    var r: ?*Vartype = null;
+                    const e = mapBinary(src1, p, &r, mrr, mrc, mcr, mcc);
                     if (e != .none) return e;
+                    da.array.data[i] = r;
                 }
-                dst.* = dm;
-                return .none;
-            },
-            .complexmatrix => |sm| {
-                const dm = vartype.newComplexMatrix(sm.rows, sm.columns) orelse return .insufficient_memory;
-                errdefer vartype.free(dm);
-                var i: usize = 0;
-                while (i < sm.data.len) : (i += 2) {
-                    const e = mcc(c.re, c.im, sm.data[i], sm.data[i + 1], &dm.complexmatrix.data[i], &dm.complexmatrix.data[i + 1]);
-                    if (e != .none) return e;
-                }
-                dst.* = dm;
+                dst.* = da;
                 return .none;
             },
             else => return .internal_error,
         },
-        .realmatrix => |sm1| switch (src2.*) {
-            .real => |y| {
-                if (vartype.containsStrings(&sm1)) return .alpha_data_is_invalid;
-                const dm = vartype.newRealMatrix(sm1.rows, sm1.columns) orelse return .insufficient_memory;
-                errdefer vartype.free(dm);
-                for (sm1.data, 0..) |x, i| {
-                    const e = mrr(x, y, &dm.realmatrix.data[i]);
+        .array => |a1| switch (src2.*) {
+            .real, .complex => {
+                if (vartype.containsStrings(src1)) return .alpha_data_is_invalid;
+                const da = vartype.newArray(@intCast(a1.data.len)) orelse return .insufficient_memory;
+                errdefer vartype.free(da);
+                for (a1.data, 0..) |item, i| {
+                    const p = item orelse return .invalid_type;
+                    var r: ?*Vartype = null;
+                    const e = mapBinary(p, src2, &r, mrr, mrc, mcr, mcc);
                     if (e != .none) return e;
+                    da.array.data[i] = r;
                 }
-                dst.* = dm;
+                dst.* = da;
                 return .none;
             },
-            .complex => |c| {
-                if (vartype.containsStrings(&sm1)) return .alpha_data_is_invalid;
-                const dm = vartype.newComplexMatrix(sm1.rows, sm1.columns) orelse return .insufficient_memory;
-                errdefer vartype.free(dm);
-                for (sm1.data, 0..) |x, i| {
-                    const e = mrc(x, c.re, c.im, &dm.complexmatrix.data[2 * i], &dm.complexmatrix.data[2 * i + 1]);
+            .array => |a2| {
+                if (a1.data.len != a2.data.len) return .dimension_error;
+                if (vartype.containsStrings(src1) or vartype.containsStrings(src2)) return .alpha_data_is_invalid;
+                const da = vartype.newArray(@intCast(a1.data.len)) orelse return .insufficient_memory;
+                errdefer vartype.free(da);
+                for (a1.data, 0..) |item1, i| {
+                    const p1 = item1 orelse return .invalid_type;
+                    const p2 = a2.data[i] orelse return .invalid_type;
+                    var r: ?*Vartype = null;
+                    const e = mapBinary(p1, p2, &r, mrr, mrc, mcr, mcc);
                     if (e != .none) return e;
+                    da.array.data[i] = r;
                 }
-                dst.* = dm;
-                return .none;
-            },
-            .realmatrix => |sm2| {
-                if (sm1.rows != sm2.rows or sm1.columns != sm2.columns) return .dimension_error;
-                if (vartype.containsStrings(&sm1) or vartype.containsStrings(&sm2)) return .alpha_data_is_invalid;
-                const dm = vartype.newRealMatrix(sm1.rows, sm1.columns) orelse return .insufficient_memory;
-                errdefer vartype.free(dm);
-                for (sm1.data, 0..) |x, i| {
-                    const e = mrr(x, sm2.data[i], &dm.realmatrix.data[i]);
-                    if (e != .none) return e;
-                }
-                dst.* = dm;
-                return .none;
-            },
-            .complexmatrix => |sm2| {
-                if (sm1.rows != sm2.rows or sm1.columns != sm2.columns) return .dimension_error;
-                if (vartype.containsStrings(&sm1)) return .alpha_data_is_invalid;
-                const dm = vartype.newComplexMatrix(sm1.rows, sm1.columns) orelse return .insufficient_memory;
-                errdefer vartype.free(dm);
-                for (sm1.data, 0..) |x, i| {
-                    const e = mrc(x, sm2.data[2 * i], sm2.data[2 * i + 1], &dm.complexmatrix.data[2 * i], &dm.complexmatrix.data[2 * i + 1]);
-                    if (e != .none) return e;
-                }
-                dst.* = dm;
-                return .none;
-            },
-            else => return .internal_error,
-        },
-        .complexmatrix => |sm1| switch (src2.*) {
-            .real => |y| {
-                const dm = vartype.newComplexMatrix(sm1.rows, sm1.columns) orelse return .insufficient_memory;
-                errdefer vartype.free(dm);
-                var i: usize = 0;
-                while (i < sm1.data.len) : (i += 2) {
-                    const e = mcr(sm1.data[i], sm1.data[i + 1], y, &dm.complexmatrix.data[i], &dm.complexmatrix.data[i + 1]);
-                    if (e != .none) return e;
-                }
-                dst.* = dm;
-                return .none;
-            },
-            .complex => |c| {
-                const dm = vartype.newComplexMatrix(sm1.rows, sm1.columns) orelse return .insufficient_memory;
-                errdefer vartype.free(dm);
-                var i: usize = 0;
-                while (i < sm1.data.len) : (i += 2) {
-                    const e = mcc(sm1.data[i], sm1.data[i + 1], c.re, c.im, &dm.complexmatrix.data[i], &dm.complexmatrix.data[i + 1]);
-                    if (e != .none) return e;
-                }
-                dst.* = dm;
-                return .none;
-            },
-            .realmatrix => |sm2| {
-                if (sm1.rows != sm2.rows or sm1.columns != sm2.columns) return .dimension_error;
-                if (vartype.containsStrings(&sm2)) return .alpha_data_is_invalid;
-                const dm = vartype.newComplexMatrix(sm1.rows, sm1.columns) orelse return .insufficient_memory;
-                errdefer vartype.free(dm);
-                for (sm2.data, 0..) |y, i| {
-                    const e = mcr(sm1.data[2 * i], sm1.data[2 * i + 1], y, &dm.complexmatrix.data[2 * i], &dm.complexmatrix.data[2 * i + 1]);
-                    if (e != .none) return e;
-                }
-                dst.* = dm;
-                return .none;
-            },
-            .complexmatrix => |sm2| {
-                if (sm1.rows != sm2.rows or sm1.columns != sm2.columns) return .dimension_error;
-                const dm = vartype.newComplexMatrix(sm1.rows, sm1.columns) orelse return .insufficient_memory;
-                errdefer vartype.free(dm);
-                var i: usize = 0;
-                while (i < sm1.data.len) : (i += 2) {
-                    const e = mcc(sm1.data[i], sm1.data[i + 1], sm2.data[i], sm2.data[i + 1], &dm.complexmatrix.data[i], &dm.complexmatrix.data[i + 1]);
-                    if (e != .none) return e;
-                }
-                dst.* = dm;
+                dst.* = da;
                 return .none;
             },
             else => return .internal_error,
@@ -443,16 +353,14 @@ pub fn genericDiv(px: *const Vartype, py: *const Vartype, dst: *?*Vartype) Err {
 }
 
 fn isMatrix(v: *const Vartype) bool {
-    return switch (v.*) {
-        .realmatrix, .complexmatrix => true,
-        else => false,
-    };
+    return vartype.matrixInfo(v) != null;
 }
 
-/// True if a vartype is a numeric type (real/complex/matrix).
+/// True if a vartype is a numeric type (real/complex/numeric array).
 pub fn assertNumeric(v: *const Vartype) Err {
     return switch (v.*) {
-        .real, .complex, .realmatrix, .complexmatrix => .none,
+        .real, .complex => .none,
+        .array => if (vartype.isNumeric(v)) .none else .alpha_data_is_invalid,
         .string => .alpha_data_is_invalid,
         else => .invalid_type,
     };

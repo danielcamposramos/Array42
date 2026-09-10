@@ -83,24 +83,33 @@ pub fn docmdRdn(arg: ?*const Arg) Err {
 pub fn docmdChs(arg: ?*const Arg) Err {
     _ = arg;
     switch (x().*) {
-        .real => |*r| r.* = phloat.neg(r.*),
-        .complex => |*c| {
-            c.re = phloat.neg(c.re);
-            c.im = phloat.neg(c.im);
-        },
-        .realmatrix => |*rm| {
-            if (vartype.containsStrings(rm)) return .alpha_data_is_invalid;
+        .real, .complex => negateInPlace(x()),
+        .array => {
+            if (vartype.containsStrings(x())) return .alpha_data_is_invalid;
             if (!vartype.disentangle(x())) return .insufficient_memory;
-            for (rm.data) |*d| d.* = phloat.neg(d.*);
-        },
-        .complexmatrix => |*cm| {
-            if (!vartype.disentangle(x())) return .insufficient_memory;
-            for (cm.data) |*d| d.* = phloat.neg(d.*);
+            negateInPlace(x());
         },
         else => return .internal_error,
     }
     helpers.printTrace();
     return .none;
+}
+
+/// Negate every numeric element of a value in place (recurses into arrays).
+fn negateInPlace(v: *Vartype) void {
+    switch (v.*) {
+        .real => |*r| r.* = phloat.neg(r.*),
+        .complex => |*c| {
+            c.re = phloat.neg(c.re);
+            c.im = phloat.neg(c.im);
+        },
+        .array => |*a| {
+            for (a.data) |item| {
+                if (item) |p| negateInPlace(p);
+            }
+        },
+        else => {},
+    }
 }
 
 pub fn docmdLastx(arg: ?*const Arg) Err {
@@ -191,18 +200,20 @@ pub fn docmdAbs(arg: ?*const Arg) Err {
             helpers.unaryResult(v);
             return .none;
         },
-        .realmatrix => |rm| {
-            if (vartype.containsStrings(&rm)) return .alpha_data_is_invalid;
-            const dm = vartype.newRealMatrix(rm.rows, rm.columns) orelse return .insufficient_memory;
-            errdefer vartype.free(dm);
-            for (rm.data, 0..) |d, i| {
-                dm.realmatrix.data[i] = if (phloat.lt(d, phloat.fromInt(0))) phloat.neg(d) else d;
-            }
-            helpers.unaryResult(dm);
+        .array => {
+            var v: ?*Vartype = null;
+            const e = helpers.mapUnary(x(), &v, mappableAbs, null);
+            if (e != .none) return e;
+            helpers.unaryResult(v.?);
             return .none;
         },
         else => return .internal_error,
     }
+}
+
+fn mappableAbs(xv: phloat.Phloat, out: *phloat.Phloat) Err {
+    out.* = if (phloat.lt(xv, phloat.fromInt(0))) phloat.neg(xv) else xv;
+    return .none;
 }
 
 pub fn docmdSign(arg: ?*const Arg) Err {
@@ -220,39 +231,33 @@ pub fn docmdSign(arg: ?*const Arg) Err {
             helpers.unaryResult(v);
             return .none;
         },
-        .realmatrix => |rm| {
-            const dm = vartype.newRealMatrix(rm.rows, rm.columns) orelse return .insufficient_memory;
-            errdefer vartype.free(dm);
-            for (rm.data, 0..) |d, i| {
-                if (rm.is_string[i] != 0) {
-                    dm.realmatrix.data[i] = phloat.fromInt(0);
-                } else {
-                    dm.realmatrix.data[i] = if (phloat.lt(d, phloat.fromInt(0))) phloat.fromInt(-1) else phloat.fromInt(1);
-                }
-            }
-            helpers.unaryResult(dm);
-            return .none;
-        },
         .complex => |c| {
             const v = signComplex(c.re, c.im) orelse return .insufficient_memory;
             helpers.unaryResult(v);
             return .none;
         },
-        .complexmatrix => |cm| {
-            const dm = vartype.newComplexMatrix(cm.rows, cm.columns) orelse return .insufficient_memory;
-            errdefer vartype.free(dm);
-            var i: usize = 0;
-            while (i < cm.data.len) : (i += 2) {
-                const v = signComplex(cm.data[i], cm.data[i + 1]) orelse return .insufficient_memory;
-                dm.complexmatrix.data[i] = v.complex.re;
-                dm.complexmatrix.data[i + 1] = v.complex.im;
-                vartype.free(v);
-            }
-            helpers.unaryResult(dm);
+        .array => {
+            var v: ?*Vartype = null;
+            const e = helpers.mapUnary(x(), &v, mappableSign, mappableSignC);
+            if (e != .none) return e;
+            helpers.unaryResult(v.?);
             return .none;
         },
         else => return .internal_error,
     }
+}
+
+fn mappableSign(xv: phloat.Phloat, out: *phloat.Phloat) Err {
+    out.* = if (phloat.lt(xv, phloat.fromInt(0))) phloat.fromInt(-1) else phloat.fromInt(1);
+    return .none;
+}
+
+fn mappableSignC(xre: phloat.Phloat, xim: phloat.Phloat, ore: *phloat.Phloat, oim: *phloat.Phloat) Err {
+    const v = signComplex(xre, xim) orelse return .insufficient_memory;
+    defer vartype.free(v);
+    ore.* = v.complex.re;
+    oim.* = v.complex.im;
+    return .none;
 }
 
 fn signComplex(xre: phloat.Phloat, xim: phloat.Phloat) ?*Vartype {

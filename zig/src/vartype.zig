@@ -1,51 +1,41 @@
 //! vartype — the HP-42S variable data type.
 //!
-//! Zig port of Free42's `common/core_variables.h`. A `Vartype` is a tagged
-//! union over the six HP-42S object types: real, complex, real matrix,
-//! complex matrix, string, and list.
+//! Zig port of Free42's `common/core_variables.h`, extended to the DB48X-grade
+//! array model. A `Vartype` is a tagged union over the object types: real,
+//! complex, string, and array. An array is a vector of vartype pointers, so a
+//! matrix is an array of arrays (rows), and arrays nest to arbitrary depth.
 //!
-//! The C++ original uses a common leading `int type` field plus downcasts; the
-//! Zig port uses a native tagged union, which is the same shape with the tag
-//! checked by the compiler instead of by hand.
+//! The C++ original uses a common leading `int type` field plus downcasts, and
+//! keeps three separate container types (real matrix, complex matrix, list).
+//! The Zig port unifies those into one recursive `array` type, which is the
+//! DB48X model: a matrix is a vector of vectors, and element-wise vs matrix
+//! semantics are chosen by the operation, not the type.
 //!
 //! Memory model: the C++ original uses malloc/free with reference-counted
-//! matrix data (`realmatrix_data` / `complexmatrix_data`). This slice keeps
-//! matrices *owned* (no sharing), so `disentangle` is a no-op that always
-//! succeeds. Reference-counted sharing is reintroduced when the matrix editor
-//! and STO/RCL land.
+//! matrix data. This slice keeps arrays *owned* (no sharing), so `disentangle`
+//! is a no-op that always succeeds. Reference-counted sharing is reintroduced
+//! when the matrix editor and STO/RCL land.
 
 const std = @import("std");
 const phloat = @import("phloat.zig");
 
 const alloc = std.heap.c_allocator;
 
-/// The six HP-42S object types (matches `TYPE_*` in core_variables.h).
+/// The HP-42S object types (matches `TYPE_*` in core_variables.h, with the
+/// three container types folded into one `array`).
 pub const Type = enum(u8) {
     empty = 0,
     real = 1,
     complex = 2,
-    realmatrix = 3,
-    complexmatrix = 4,
-    string = 5,
-    list = 6,
+    string = 3,
+    array = 4,
 };
 
-/// A real matrix: `rows` × `columns` of phloat, with a parallel `is_string`
-/// array (0 = number, 1 = short string, 2 = long string) for the HP-42S
-/// "matrix of strings" feature.
-pub const RealMatrix = struct {
-    rows: i32,
-    columns: i32,
-    data: []phloat.Phloat,
-    is_string: []u8,
-};
-
-/// A complex matrix: `rows` × `columns` of complex values, stored as
-/// interleaved (re, im) pairs.
-pub const ComplexMatrix = struct {
-    rows: i32,
-    columns: i32,
-    data: []phloat.Phloat,
+/// An array: an owned vector of pointers to other vartypes. A matrix is an
+/// array whose elements are all arrays (rows) of the same length; a vector is
+/// an array of scalars; deeper nesting gives higher-rank arrays.
+pub const Array = struct {
+    data: []?*Vartype,
 };
 
 /// A string value (owned buffer).
@@ -53,19 +43,12 @@ pub const String = struct {
     text: []u8,
 };
 
-/// A list value: an owned array of pointers to other vartypes.
-pub const List = struct {
-    data: []?*Vartype,
-};
-
 pub const Vartype = union(Type) {
     empty: void,
     real: phloat.Phloat,
     complex: struct { re: phloat.Phloat, im: phloat.Phloat },
-    realmatrix: RealMatrix,
-    complexmatrix: ComplexMatrix,
     string: String,
-    list: List,
+    array: Array,
 };
 
 // ---------------------------------------------------------------------------
@@ -94,37 +77,8 @@ pub fn newString(s: []const u8) ?*Vartype {
     return v;
 }
 
-pub fn newRealMatrix(rows: i32, columns: i32) ?*Vartype {
-    const n: usize = @intCast(rows * columns);
-    const data = alloc.alloc(phloat.Phloat, n) catch return null;
-    const is_string = alloc.alloc(u8, n) catch {
-        alloc.free(data);
-        return null;
-    };
-    @memset(data, phloat.fromInt(0));
-    @memset(is_string, 0);
-    const v = alloc.create(Vartype) catch {
-        alloc.free(data);
-        alloc.free(is_string);
-        return null;
-    };
-    v.* = .{ .realmatrix = .{ .rows = rows, .columns = columns, .data = data, .is_string = is_string } };
-    return v;
-}
-
-pub fn newComplexMatrix(rows: i32, columns: i32) ?*Vartype {
-    const n: usize = @intCast(2 * rows * columns);
-    const data = alloc.alloc(phloat.Phloat, n) catch return null;
-    @memset(data, phloat.fromInt(0));
-    const v = alloc.create(Vartype) catch {
-        alloc.free(data);
-        return null;
-    };
-    v.* = .{ .complexmatrix = .{ .rows = rows, .columns = columns, .data = data } };
-    return v;
-}
-
-pub fn newList(size: i32) ?*Vartype {
+/// Create an array of `size` null slots.
+pub fn newArray(size: i32) ?*Vartype {
     const n: usize = @intCast(size);
     const data = alloc.alloc(?*Vartype, n) catch return null;
     @memset(data, null);
@@ -132,7 +86,7 @@ pub fn newList(size: i32) ?*Vartype {
         alloc.free(data);
         return null;
     };
-    v.* = .{ .list = .{ .data = data } };
+    v.* = .{ .array = .{ .data = data } };
     return v;
 }
 
@@ -143,18 +97,13 @@ pub fn newList(size: i32) ?*Vartype {
 /// Free a vartype and everything it owns.
 pub fn free(v: *Vartype) void {
     switch (v.*) {
-        .realmatrix => |m| {
-            alloc.free(m.data);
-            alloc.free(m.is_string);
-        },
-        .complexmatrix => |m| alloc.free(m.data),
-        .string => |s| alloc.free(s.text),
-        .list => |l| {
-            for (l.data) |item| {
+        .array => |a| {
+            for (a.data) |item| {
                 if (item) |p| free(p);
             }
-            alloc.free(l.data);
+            alloc.free(a.data);
         },
+        .string => |s| alloc.free(s.text),
         else => {},
     }
     alloc.destroy(v);
@@ -175,23 +124,12 @@ pub fn dup(v: *const Vartype) ?*Vartype {
         .empty => return alloc.create(Vartype) catch null,
         .real => |x| return newReal(x),
         .complex => |c| return newComplex(c.re, c.im),
-        .realmatrix => |m| {
-            const nv = newRealMatrix(m.rows, m.columns) orelse return null;
-            @memcpy(nv.realmatrix.data, m.data);
-            @memcpy(nv.realmatrix.is_string, m.is_string);
-            return nv;
-        },
-        .complexmatrix => |m| {
-            const nv = newComplexMatrix(m.rows, m.columns) orelse return null;
-            @memcpy(nv.complexmatrix.data, m.data);
-            return nv;
-        },
         .string => |s| return newString(s.text),
-        .list => |l| {
-            const nv = newList(@intCast(l.data.len)) orelse return null;
-            for (l.data, 0..) |item, i| {
+        .array => |a| {
+            const nv = newArray(@intCast(a.data.len)) orelse return null;
+            for (a.data, 0..) |item, i| {
                 if (item) |p| {
-                    nv.list.data[i] = dup(p) orelse {
+                    nv.array.data[i] = dup(p) orelse {
                         free(nv);
                         return null;
                     };
@@ -202,7 +140,7 @@ pub fn dup(v: *const Vartype) ?*Vartype {
     }
 }
 
-/// Make a matrix's data private. In this slice matrices are always owned, so
+/// Make an array's data private. In this slice arrays are always owned, so
 /// this always succeeds. (The C++ original shares matrix data via refcounts;
 /// that sharing is reintroduced with the matrix editor.)
 pub fn disentangle(v: *Vartype) bool {
@@ -210,12 +148,77 @@ pub fn disentangle(v: *Vartype) bool {
     return true;
 }
 
-/// True if a real matrix contains any string elements.
-pub fn containsStrings(rm: *const RealMatrix) bool {
-    for (rm.is_string) |s| {
-        if (s != 0) return true;
+// ---------------------------------------------------------------------------
+// Array classification
+// ---------------------------------------------------------------------------
+
+/// True if a value is numeric: a real, a complex, or an array whose elements
+/// are all numeric (recursively). An empty array is vacuously numeric.
+pub fn isNumeric(v: *const Vartype) bool {
+    return switch (v.*) {
+        .real, .complex => true,
+        .array => |a| {
+            for (a.data) |item| {
+                const p = item orelse return false;
+                if (!isNumeric(p)) return false;
+            }
+            return true;
+        },
+        else => false,
+    };
+}
+
+/// True if a value contains a string at any depth.
+pub fn containsStrings(v: *const Vartype) bool {
+    return switch (v.*) {
+        .string => true,
+        .array => |a| {
+            for (a.data) |item| {
+                if (item) |p| {
+                    if (containsStrings(p)) return true;
+                }
+            }
+            return false;
+        },
+        else => false,
+    };
+}
+
+/// The shape of a 2D numeric array (a matrix): an array whose elements are all
+/// arrays (rows) of the same length, each holding only reals and complexes.
+pub const MatrixInfo = struct {
+    rows: i32,
+    columns: i32,
+    is_complex: bool,
+};
+
+/// If `v` is a matrix (2D numeric array), return its shape; else null.
+pub fn matrixInfo(v: *const Vartype) ?MatrixInfo {
+    const a = switch (v.*) {
+        .array => |a| a,
+        else => return null,
+    };
+    if (a.data.len == 0) return null;
+    var columns: i32 = -1;
+    var is_complex = false;
+    for (a.data) |row_opt| {
+        const row = row_opt orelse return null;
+        const ra = switch (row.*) {
+            .array => |ra| ra,
+            else => return null,
+        };
+        if (columns == -1) columns = @intCast(ra.data.len);
+        if (ra.data.len != columns) return null;
+        for (ra.data) |elem_opt| {
+            const elem = elem_opt orelse return null;
+            switch (elem.*) {
+                .real => {},
+                .complex => is_complex = true,
+                else => return null,
+            }
+        }
     }
-    return false;
+    return .{ .rows = @intCast(a.data.len), .columns = columns, .is_complex = is_complex };
 }
 
 // ---------------------------------------------------------------------------
@@ -234,17 +237,39 @@ test "newReal / dup / free round-trip" {
     try std.testing.expectEqualStrings("3.14", phloat.toString(d.real));
 }
 
-test "complex and matrix construction" {
+test "complex and array construction" {
     phloat.init();
     const c = newComplex(phloat.fromInt(1), phloat.fromInt(2)) orelse return error.OOM;
     defer free(c);
     try std.testing.expectEqualStrings("1", phloat.toString(c.complex.re));
     try std.testing.expectEqualStrings("2", phloat.toString(c.complex.im));
 
-    const m = newRealMatrix(2, 3) orelse return error.OOM;
+    const a = newArray(3) orelse return error.OOM;
+    defer free(a);
+    try std.testing.expectEqual(@as(usize, 3), a.array.data.len);
+    try std.testing.expect(!containsStrings(a));
+}
+
+test "matrixInfo classifies a 2D numeric array" {
+    phloat.init();
+    // [[1,2,3],[4,5,6]] — 2×3 real matrix.
+    const m = newArray(2) orelse return error.OOM;
     defer free(m);
-    try std.testing.expectEqual(@as(i32, 2), m.realmatrix.rows);
-    try std.testing.expectEqual(@as(i32, 3), m.realmatrix.columns);
-    try std.testing.expectEqual(@as(usize, 6), m.realmatrix.data.len);
-    try std.testing.expect(!containsStrings(&m.realmatrix));
+    const r0 = newArray(3) orelse return error.OOM;
+    const r1 = newArray(3) orelse return error.OOM;
+    m.array.data[0] = r0;
+    m.array.data[1] = r1;
+    r0.array.data[0] = newReal(phloat.fromInt(1)) orelse return error.OOM;
+    r0.array.data[1] = newReal(phloat.fromInt(2)) orelse return error.OOM;
+    r0.array.data[2] = newReal(phloat.fromInt(3)) orelse return error.OOM;
+    r1.array.data[0] = newReal(phloat.fromInt(4)) orelse return error.OOM;
+    r1.array.data[1] = newReal(phloat.fromInt(5)) orelse return error.OOM;
+    r1.array.data[2] = newReal(phloat.fromInt(6)) orelse return error.OOM;
+
+    const info = matrixInfo(m) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i32, 2), info.rows);
+    try std.testing.expectEqual(@as(i32, 3), info.columns);
+    try std.testing.expect(!info.is_complex);
+    try std.testing.expect(isNumeric(m));
+    try std.testing.expect(!containsStrings(m));
 }
