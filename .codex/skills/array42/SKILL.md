@@ -71,3 +71,44 @@ eval("dot([1,2,3],[4,5,6])")      → 32
 - **Do not use Array42** for: symbolic simplification, derivatives, indefinite
   integrals, or solving for a formula. That is SymPy/Wolfram territory — the
   ceiling this tool deliberately sits below.
+
+## Driving it raw (when the MCP tools aren't loaded)
+
+If this session does not have the `array42` MCP tools available, drive the
+server directly over stdio JSON-RPC. The binary is at
+`zig/zig-out/bin/array42-mcp` (repo root) — rebuild with `zig build` if it is
+missing or fails to exec.
+
+**Protocol.** Newline-delimited JSON-RPC 2.0 on stdin/stdout: one JSON object
+per line, one response line per request (nothing for notifications). The
+server is **stateful** — the stack and named variables persist only within a
+single process, so pipe *all* requests into one invocation.
+
+**Handshake** (send first):
+
+```
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"me","version":"0"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+```
+
+**Tool calls** use method `tools/call` with
+`params: {"name": <tool>, "arguments": <obj>}`. The tools and their argument
+schemas are the same as the MCP tools above (`eval` → `{expression}`, `store`
+→ `{name, expression}`, `recall` → `{name}`, `vars`/`stack`/`clear` → `{}`,
+`mode` → `{angle}`).
+
+**Invocation pattern** (whole session in one pipe):
+
+```sh
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"me","version":"0"}}}' \
+  '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"eval","arguments":{"expression":"450 * 9.80665 * ln(2000000/200000)"}}}' \
+  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"eval","arguments":{"expression":"cross([0.5,0,0],[0,100,0])"}}}' \
+  | zig/zig-out/bin/array42-mcp
+```
+
+The result is in `result.content[0].text`; `isError: true` means the expression
+failed. `det`/`inv` go through LU decomposition, so integer results may show a
+tiny tail (e.g. `-2.000…001` instead of `-2`) — that is ~33 correct digits,
+not a bug.
