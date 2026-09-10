@@ -43,12 +43,13 @@ pub fn build(b: *std.Build) void {
 
     // hrmr — the HR/MR compiler (SOURCE/MR/HR doctrine). Generates the
     // comment-stripped MR sources (zig-out/mr/) and the doc-comment HR
-    // projection (zig-out/hr/) from src/.
+    // projection (zig-out/hr/) from src/. It runs on the host during the
+    // build, so it must be compiled for the host target, not the cross target.
     const hrmr_exe = b.addExecutable(.{
         .name = "hrmr",
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/hrmr.zig"),
-            .target = target,
+            .target = b.graph.host,
             .optimize = optimize,
         }),
     });
