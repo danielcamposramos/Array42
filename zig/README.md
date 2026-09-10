@@ -6,9 +6,12 @@ EchoSystems patchset — same language, more robust frontend).
 
 ## Status
 
-**Step 3 (transcendentals) — done.** `phloat.zig` now implements sqrt, exp,
-log, log10, trig, inverse trig, hyperbolic, pow, and gamma from argument
-reduction + Taylor series to full 34-digit decQuad precision. All 24 tests pass.
+**Step 3 (transcendentals) — done.** `phloat.zig` implements sqrt, exp, log,
+log10, trig, inverse trig, hyperbolic, pow, and gamma from argument reduction +
+Taylor series to full 34-digit decQuad precision, and `commands2.zig` ports the
+transcendental commands (SIN/COS/TAN/ASIN/ACOS/ATAN/LOG/LN/10^X/E^X/SQRT/X^2/
+1/X/Y^X/→REC/→POL/RND/N!/SINH/COSH/TANH/ASINH/ACOSH/ATANH/LN1+X). All 31 tests
+pass.
 
 ## Roadmap
 
