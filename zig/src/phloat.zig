@@ -33,6 +33,12 @@ threadlocal var str_buf: [43]u8 = undefined;
 pub fn init() void {
     _ = c.decContextDefault(&ctx, c.DEC_INIT_DECQUAD);
     PI = fromString("3.141592653589793238462643383279503");
+    PI_2 = div(PI, fromInt(2));
+    PI_4 = div(PI, fromInt(4));
+    TWO_PI = mul(PI, fromInt(2));
+    LN2 = fromString("0.6931471805599453094172321214581766");
+    LN10 = fromString("2.302585092994045684017991454684364");
+    E = fromString("2.718281828459045235360287471352662");
     POS_HUGE = fromString("9.999999999999999999999999999999999E+6144");
     NEG_HUGE = fromString("-9.999999999999999999999999999999999E+6144");
     POS_TINY = fromString("1E-6143");
@@ -250,6 +256,12 @@ pub fn isInteger(p: Phloat) bool {
 // ---------------------------------------------------------------------------
 
 pub var PI: Phloat = undefined;
+pub var PI_2: Phloat = undefined;
+pub var PI_4: Phloat = undefined;
+pub var TWO_PI: Phloat = undefined;
+pub var LN2: Phloat = undefined;
+pub var LN10: Phloat = undefined;
+pub var E: Phloat = undefined;
 pub var POS_HUGE: Phloat = undefined;
 pub var NEG_HUGE: Phloat = undefined;
 pub var POS_TINY: Phloat = undefined;
@@ -259,118 +271,405 @@ pub var NAN_1: Phloat = undefined;
 pub var NAN_2: Phloat = undefined;
 
 // ---------------------------------------------------------------------------
-// Transcendentals — deferred to step 3 (decNumber lacks trig/gamma).
+// Transcendentals — built on decNumber's core arithmetic.
+//
+// decNumber provides only add/sub/mul/div, so these are implemented from
+// argument reduction + Taylor series, computed to the full 34-digit decQuad
+// precision. Each series runs until the running sum stops changing (i.e. the
+// next term is below the last representable digit), with a safety cap.
 // ---------------------------------------------------------------------------
 
-fn notYet(comptime name: []const u8) noreturn {
-    @panic(std.fmt.comptimePrint("phloat.{s}: not yet implemented (step 3)", .{name}));
+const MAX_ITER: usize = 200;
+
+/// Round to the nearest integer and convert to i32.
+fn roundToInt(p: Phloat) i32 {
+    return toInt(round(p));
+}
+
+// --- series kernels ---------------------------------------------------------
+
+fn expSeries(r: Phloat) Phloat {
+    // exp(r) = 1 + r + r^2/2! + r^3/3! + ...  (|r| <= ln(2)/2)
+    var sum = fromInt(1);
+    var term = fromInt(1);
+    var n: i32 = 1;
+    while (n <= MAX_ITER) : (n += 1) {
+        term = div(mul(term, r), fromInt(n));
+        const next = add(sum, term);
+        if (eq(next, sum)) break;
+        sum = next;
+    }
+    return sum;
+}
+
+fn logSeries(z: Phloat) Phloat {
+    // log((1+z)/(1-z)) = 2*(z + z^3/3 + z^5/5 + ...)  (|z| < 1)
+    const z2 = mul(z, z);
+    var term = z;
+    var sum = z;
+    var n: i32 = 1;
+    while (n <= MAX_ITER) : (n += 1) {
+        term = mul(term, z2);
+        const next = div(term, fromInt(2 * n + 1));
+        const s2 = add(sum, next);
+        if (eq(s2, sum)) break;
+        sum = s2;
+    }
+    return mul(sum, fromInt(2));
+}
+
+fn sinSeries(r: Phloat) Phloat {
+    // sin(r) = r - r^3/3! + r^5/5! - ...  (|r| <= pi/4)
+    const r2 = mul(r, r);
+    var term = r;
+    var sum = r;
+    var n: i32 = 1;
+    while (n <= MAX_ITER) : (n += 1) {
+        term = neg(div(mul(term, r2), fromInt((2 * n) * (2 * n + 1))));
+        const next = add(sum, term);
+        if (eq(next, sum)) break;
+        sum = next;
+    }
+    return sum;
+}
+
+fn cosSeries(r: Phloat) Phloat {
+    // cos(r) = 1 - r^2/2! + r^4/4! - ...  (|r| <= pi/4)
+    const r2 = mul(r, r);
+    var term = fromInt(1);
+    var sum = fromInt(1);
+    var n: i32 = 1;
+    while (n <= MAX_ITER) : (n += 1) {
+        term = neg(div(mul(term, r2), fromInt((2 * n - 1) * (2 * n))));
+        const next = add(sum, term);
+        if (eq(next, sum)) break;
+        sum = next;
+    }
+    return sum;
+}
+
+fn atanSeries(x: Phloat) Phloat {
+    // atan(x) = x - x^3/3 + x^5/5 - ...  (|x| <= 1)
+    const x2 = mul(x, x);
+    var term = x;
+    var sum = x;
+    var n: i32 = 1;
+    while (n <= MAX_ITER) : (n += 1) {
+        term = neg(mul(term, x2));
+        const next = div(term, fromInt(2 * n + 1));
+        const s2 = add(sum, next);
+        if (eq(s2, sum)) break;
+        sum = s2;
+    }
+    return sum;
+}
+
+// --- public functions -------------------------------------------------------
+
+pub fn sqrt(p: Phloat) Phloat {
+    if (isNaN(p)) return NAN;
+    if (isZero(p)) return p;
+    if (isNegative(p)) return NAN;
+    if (isInf(p)) return POS_HUGE;
+    // Newton's method, seeded from a double-precision estimate.
+    var x = fromDouble(std.math.sqrt(toDouble(p)));
+    var n: usize = 0;
+    while (n < MAX_ITER) : (n += 1) {
+        const nx = div(add(x, div(p, x)), fromInt(2));
+        if (eq(nx, x)) break;
+        x = nx;
+    }
+    return x;
+}
+
+pub fn exp(p: Phloat) Phloat {
+    if (isNaN(p)) return NAN;
+    if (isInf(p)) return if (isNegative(p)) fromInt(0) else POS_HUGE;
+    // Reduce: p = n*ln(10) + r, r in [-ln(10)/2, ln(10)/2]; exp(p) = 10^n * exp(r).
+    const n = roundToInt(div(p, LN10));
+    const r = sub(p, mul(fromInt(n), LN10));
+    return scaleb(expSeries(r), n);
+}
+
+pub fn log(p: Phloat) Phloat {
+    if (isNaN(p)) return NAN;
+    if (isZero(p)) return NEG_HUGE;
+    if (isNegative(p)) return NAN;
+    if (isInf(p)) return POS_HUGE;
+    // Reduce: p = m * 10^e, m in [1, 10); then halve m to [1, 2) so the
+    // atanh series converges quickly. log(p) = log(m) + k*ln(2) + e*ln(10).
+    const e = logb(p);
+    var m = scaleb(p, -e);
+    var k: i32 = 0;
+    while (ge(m, fromInt(2))) {
+        m = div(m, fromInt(2));
+        k += 1;
+    }
+    const z = div(sub(m, fromInt(1)), add(m, fromInt(1)));
+    return add(add(logSeries(z), mul(fromInt(k), LN2)), mul(fromInt(e), LN10));
+}
+
+pub fn log10(p: Phloat) Phloat {
+    return div(log(p), LN10);
+}
+
+pub fn log1p(p: Phloat) Phloat {
+    if (isZero(p)) return fromInt(0);
+    if (lt(abs(p), fromString("0.01"))) {
+        // log(1+p) = p - p^2/2 + p^3/3 - ...  (accurate for small p)
+        var term = p;
+        var sum = p;
+        var n: i32 = 2;
+        while (n <= MAX_ITER) : (n += 1) {
+            term = neg(mul(term, p));
+            const next = div(term, fromInt(n));
+            const s2 = add(sum, next);
+            if (eq(s2, sum)) break;
+            sum = s2;
+        }
+        return sum;
+    }
+    return log(add(fromInt(1), p));
+}
+
+pub fn expm1(p: Phloat) Phloat {
+    if (isZero(p)) return fromInt(0);
+    if (lt(abs(p), fromString("0.01"))) {
+        // exp(p)-1 = p + p^2/2! + p^3/3! + ...  (accurate for small p)
+        var term = p;
+        var sum = p;
+        var n: i32 = 2;
+        while (n <= MAX_ITER) : (n += 1) {
+            term = div(mul(term, p), fromInt(n));
+            const next = add(sum, term);
+            if (eq(next, sum)) break;
+            sum = next;
+        }
+        return sum;
+    }
+    return sub(exp(p), fromInt(1));
 }
 
 pub fn sin(p: Phloat) Phloat {
-    _ = p;
-    notYet("sin");
+    var s: Phloat = undefined;
+    var c_: Phloat = undefined;
+    sincos(p, &s, &c_);
+    return s;
 }
+
 pub fn cos(p: Phloat) Phloat {
-    _ = p;
-    notYet("cos");
+    var s: Phloat = undefined;
+    var c_: Phloat = undefined;
+    sincos(p, &s, &c_);
+    return c_;
 }
+
 pub fn tan(p: Phloat) Phloat {
-    _ = p;
-    notYet("tan");
+    if (isNaN(p)) return NAN;
+    var s: Phloat = undefined;
+    var c_: Phloat = undefined;
+    sincos(p, &s, &c_);
+    if (isZero(c_)) return if (isNegative(s)) NEG_HUGE else POS_HUGE;
+    return div(s, c_);
 }
-pub fn asin(p: Phloat) Phloat {
-    _ = p;
-    notYet("asin");
-}
-pub fn acos(p: Phloat) Phloat {
-    _ = p;
-    notYet("acos");
-}
-pub fn atan(p: Phloat) Phloat {
-    _ = p;
-    notYet("atan");
-}
+
 pub fn sincos(phi: Phloat, s: *Phloat, c_: *Phloat) void {
-    _ = phi;
-    _ = s;
-    _ = c_;
-    notYet("sincos");
+    if (isNaN(phi) or isInf(phi)) {
+        s.* = NAN;
+        c_.* = NAN;
+        return;
+    }
+    // Reduce: phi = q*(pi/2) + r, r in [-pi/4, pi/4]; use the quadrant q mod 4.
+    const q = round(div(phi, PI_2));
+    const r = sub(phi, mul(q, PI_2));
+    const qi = @mod(toInt(q), 4);
+    const sr = sinSeries(r);
+    const cr = cosSeries(r);
+    switch (qi) {
+        0 => {
+            s.* = sr;
+            c_.* = cr;
+        },
+        1 => {
+            s.* = cr;
+            c_.* = neg(sr);
+        },
+        2 => {
+            s.* = neg(sr);
+            c_.* = neg(cr);
+        },
+        3 => {
+            s.* = neg(cr);
+            c_.* = sr;
+        },
+        else => unreachable,
+    }
 }
-pub fn hypot(x: Phloat, y: Phloat) Phloat {
-    _ = x;
-    _ = y;
-    notYet("hypot");
+
+pub fn asin(p: Phloat) Phloat {
+    if (isNaN(p)) return NAN;
+    if (gt(abs(p), fromInt(1))) return NAN;
+    if (eq(abs(p), fromInt(1))) return if (isNegative(p)) neg(PI_2) else PI_2;
+    // asin(x) = atan(x / sqrt(1 - x^2))
+    return atan(div(p, sqrt(sub(fromInt(1), mul(p, p)))));
 }
+
+pub fn acos(p: Phloat) Phloat {
+    if (isNaN(p)) return NAN;
+    if (gt(abs(p), fromInt(1))) return NAN;
+    if (eq(p, fromInt(1))) return fromInt(0);
+    if (eq(p, fromInt(-1))) return PI;
+    // acos(x) = pi/2 - asin(x)
+    return sub(PI_2, asin(p));
+}
+
+pub fn atan(p: Phloat) Phloat {
+    if (isNaN(p)) return NAN;
+    if (isZero(p)) return fromInt(0);
+    if (isInf(p)) return if (isNegative(p)) neg(PI_2) else PI_2;
+    if (isNegative(p)) return neg(atan(neg(p)));
+    // Halve the angle until the argument is small enough for the series.
+    var x = p;
+    var k: i32 = 0;
+    while (gt(x, fromString("0.1"))) {
+        x = div(x, add(fromInt(1), sqrt(add(fromInt(1), mul(x, x)))));
+        k += 1;
+    }
+    var r = atanSeries(x);
+    while (k > 0) : (k -= 1) r = mul(r, fromInt(2));
+    return r;
+}
+
 pub fn atan2(x: Phloat, y: Phloat) Phloat {
-    _ = x;
-    _ = y;
-    notYet("atan2");
+    // atan2(x, y) = angle whose tangent is x/y (x = sine component, y = cosine).
+    if (isZero(y)) {
+        if (isZero(x)) return fromInt(0);
+        return if (isNegative(x)) neg(PI_2) else PI_2;
+    }
+    const a = atan(div(x, y));
+    if (isNegative(y)) return if (isNegative(x)) sub(a, PI) else add(a, PI);
+    return a;
 }
+
+pub fn hypot(x: Phloat, y: Phloat) Phloat {
+    const ax = abs(x);
+    const ay = abs(y);
+    if (isZero(ax)) return ay;
+    if (isZero(ay)) return ax;
+    if (gt(ax, ay)) {
+        const r = div(ay, ax);
+        return mul(ax, sqrt(add(fromInt(1), mul(r, r))));
+    }
+    const r = div(ax, ay);
+    return mul(ay, sqrt(add(fromInt(1), mul(r, r))));
+}
+
 pub fn sinh(p: Phloat) Phloat {
-    _ = p;
-    notYet("sinh");
+    if (isNaN(p)) return NAN;
+    if (isInf(p)) return p;
+    const ep = exp(p);
+    return div(sub(ep, div(fromInt(1), ep)), fromInt(2));
 }
+
 pub fn cosh(p: Phloat) Phloat {
-    _ = p;
-    notYet("cosh");
+    if (isNaN(p)) return NAN;
+    if (isInf(p)) return POS_HUGE;
+    const ep = exp(p);
+    return div(add(ep, div(fromInt(1), ep)), fromInt(2));
 }
+
 pub fn tanh(p: Phloat) Phloat {
-    _ = p;
-    notYet("tanh");
+    if (isNaN(p)) return NAN;
+    if (isInf(p)) return if (isNegative(p)) fromInt(-1) else fromInt(1);
+    const ep = exp(p);
+    const em = div(fromInt(1), ep);
+    return div(sub(ep, em), add(ep, em));
 }
+
 pub fn asinh(p: Phloat) Phloat {
-    _ = p;
-    notYet("asinh");
+    if (isNaN(p)) return NAN;
+    if (isInf(p)) return p;
+    return log(add(p, sqrt(add(mul(p, p), fromInt(1)))));
 }
+
 pub fn acosh(p: Phloat) Phloat {
-    _ = p;
-    notYet("acosh");
+    if (isNaN(p)) return NAN;
+    if (lt(p, fromInt(1))) return NAN;
+    return log(add(p, sqrt(sub(mul(p, p), fromInt(1)))));
 }
+
 pub fn atanh(p: Phloat) Phloat {
-    _ = p;
-    notYet("atanh");
+    if (isNaN(p)) return NAN;
+    if (eq(abs(p), fromInt(1))) return if (isNegative(p)) NEG_HUGE else POS_HUGE;
+    if (gt(abs(p), fromInt(1))) return NAN;
+    return div(log(div(add(fromInt(1), p), sub(fromInt(1), p))), fromInt(2));
 }
-pub fn log(p: Phloat) Phloat {
-    _ = p;
-    notYet("log");
-}
-pub fn log1p(p: Phloat) Phloat {
-    _ = p;
-    notYet("log1p");
-}
-pub fn log10(p: Phloat) Phloat {
-    _ = p;
-    notYet("log10");
-}
-pub fn exp(p: Phloat) Phloat {
-    _ = p;
-    notYet("exp");
-}
-pub fn expm1(p: Phloat) Phloat {
-    _ = p;
-    notYet("expm1");
-}
-pub fn tgamma(p: Phloat) Phloat {
-    _ = p;
-    notYet("tgamma");
-}
-pub fn sqrt(p: Phloat) Phloat {
-    _ = p;
-    notYet("sqrt");
-}
+
 pub fn pow(x: Phloat, y: Phloat) Phloat {
-    _ = x;
-    _ = y;
-    notYet("pow");
+    if (isNaN(x) or isNaN(y)) return NAN;
+    if (isZero(x)) {
+        if (isZero(y)) return fromInt(1);
+        if (isNegative(y)) return POS_HUGE;
+        return fromInt(0);
+    }
+    if (isNegative(x)) {
+        if (!isInteger(y)) return NAN;
+        const r = exp(mul(y, log(neg(x))));
+        return if (@mod(toInt(y), 2) == 0) r else neg(r);
+    }
+    return exp(mul(y, log(x)));
 }
-pub fn ilogb(x: Phloat) i32 {
-    _ = x;
-    notYet("ilogb");
+
+pub fn tgamma(p: Phloat) Phloat {
+    // Lanczos approximation (g=7, n=9), with reflection for x < 0.5. The
+    // coefficients are double-precision, so this is ~15 digits — enough for
+    // the 12-digit display, but not full decQuad precision.
+    if (isNaN(p)) return NAN;
+    if (isInf(p)) return if (isNegative(p)) NAN else POS_HUGE;
+    if (isInteger(p) and le(p, fromInt(0))) return NAN;
+    if (lt(p, fromString("0.5"))) {
+        const g = tgamma(sub(fromInt(1), p));
+        return div(PI, mul(sin(mul(PI, p)), g));
+    }
+    const g = fromString("7");
+    const coeff = [_]Phloat{
+        fromString("0.99999999999980993"),
+        fromString("676.5203681218851"),
+        fromString("-1259.1392167224028"),
+        fromString("771.32342877765313"),
+        fromString("-176.61502916214059"),
+        fromString("12.507343278686905"),
+        fromString("-0.13857109526572012"),
+        fromString("9.9843695780195716E-6"),
+        fromString("1.5056327351493116E-7"),
+    };
+    var a = coeff[0];
+    var k: i32 = 1;
+    while (k <= 8) : (k += 1) {
+        a = add(a, div(coeff[@intCast(k)], add(p, fromInt(k - 1))));
+    }
+    const t = add(p, sub(g, fromString("0.5")));
+    const sqrt2pi = sqrt(mul(fromInt(2), PI));
+    const term1 = pow(t, sub(p, fromString("0.5")));
+    const term2 = exp(neg(t));
+    return mul(mul(mul(sqrt2pi, term1), term2), a);
 }
-pub fn scalbn(x: Phloat, y: i32) Phloat {
-    _ = x;
-    _ = y;
-    notYet("scalbn");
+
+/// Base-10 exponent: returns e such that x = m * 10^e with m in [1, 10).
+/// (decNumber's LogB is base-10, unlike C's base-2 `ilogb`.)
+pub fn logb(x: Phloat) i32 {
+    var r: Phloat = undefined;
+    _ = c.decQuadLogB(&r, &x, &ctx);
+    return toInt(r);
+}
+
+/// Scale by a power of ten: returns x * 10^y. (decNumber's ScaleB is base-10,
+/// unlike C's base-2 `scalbn`.)
+pub fn scaleb(x: Phloat, y: i32) Phloat {
+    var r: Phloat = undefined;
+    const n = fromInt(y);
+    _ = c.decQuadScaleB(&r, &x, &n, &ctx);
+    return r;
 }
 
 // ---------------------------------------------------------------------------
@@ -409,4 +708,60 @@ test "string round-trip" {
     init();
     const s = "12345.6789";
     try std.testing.expectEqualStrings(s, toString(fromString(s)));
+}
+
+/// Assert that `actual` matches `expected` to within 1e-28 (transcendentals are
+/// irrational, so exact string equality is not expected).
+fn expectClose(expected: []const u8, actual: Phloat) !void {
+    const es = fromString(expected);
+    const diff = abs(sub(es, actual));
+    const tol = fromString("1E-28");
+    try std.testing.expect(lt(diff, tol));
+}
+
+test "sqrt" {
+    init();
+    try expectClose("1.414213562373095048801688724209698", sqrt(fromInt(2)));
+    try expectClose("3", sqrt(fromInt(9)));
+    try expectClose("0", sqrt(fromInt(0)));
+}
+
+test "exp and log" {
+    init();
+    try expectClose("2.718281828459045235360287471352662", exp(fromInt(1)));
+    try expectClose("1", log(E));
+    try expectClose("3", log10(fromInt(1000)));
+    try expectClose("0.6931471805599453094172321214581766", log(fromInt(2)));
+}
+
+test "sin cos tan" {
+    init();
+    try expectClose("1", sin(PI_2));
+    try expectClose("0", sin(fromInt(0)));
+    try expectClose("1", cos(fromInt(0)));
+    try expectClose("1", tan(PI_4));
+    try expectClose("0", sin(PI));
+}
+
+test "inverse trig" {
+    init();
+    try expectClose("0.7853981633974483096156608458198757", atan(fromInt(1)));
+    try expectClose("1.570796326794896619231321691639751", asin(fromInt(1)));
+    try expectClose("1.570796326794896619231321691639751", acos(fromInt(0)));
+}
+
+test "hyperbolic" {
+    init();
+    try expectClose("0", sinh(fromInt(0)));
+    try expectClose("1", cosh(fromInt(0)));
+    try expectClose("0", tanh(fromInt(0)));
+    try expectClose("0", asinh(fromInt(0)));
+    try expectClose("0", acosh(fromInt(1)));
+    try expectClose("0", atanh(fromInt(0)));
+}
+
+test "pow" {
+    init();
+    try expectClose("1024", pow(fromInt(2), fromInt(10)));
+    try expectClose("2", pow(fromInt(4), fromString("0.5")));
 }

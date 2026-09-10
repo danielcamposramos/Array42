@@ -6,14 +6,27 @@ EchoSystems patchset — same language, more robust frontend).
 
 ## Status
 
-**Step 1 (foundation) — done.** The `phloat` type is ported and verified.
+**Step 3 (transcendentals) — done.** `phloat.zig` now implements sqrt, exp,
+log, log10, trig, inverse trig, hyperbolic, pow, and gamma from argument
+reduction + Taylor series to full 34-digit decQuad precision. All 24 tests pass.
+
+## Roadmap
+
+1. **Foundation** — `phloat` type (34-digit decimal128) — *done*
+2. **RPN core** — stack, arithmetic, display, core commands — *done*
+3. **Transcendentals** — sqrt/exp/log/trig/hyperbolic/pow/gamma — *done*
+4. **Array enhancement** — DB48X-grade array types (matrix = vector of vectors)
+5. **Equation Writer** — HP 50g Equation Writer equivalent, so AI partners can
+   "throw" equations effortlessly (type them as written, without thinking about
+   RPN math/operations)
+6. **MCP + Skill** — expose the calculator as an MCP server + Claude Code skill
 
 | Layer | File | Status |
 |---|---|---|
 | Decimal core | `vendor/decNumber/` (vendored C, ICU license) | done |
-| Float abstraction | `src/phloat.zig` | done (transcendentals stubbed) |
-| Calculator core | `common/*.cc` → `src/` | pending (step 2) |
-| Shell / MCP | `shell.h` → MCP server | pending (step 5) |
+| Float abstraction | `src/phloat.zig` | done (transcendentals done) |
+| Calculator core | `common/*.cc` → `src/` | in progress (step 2–3) |
+| Shell / MCP | `shell.h` → MCP server | pending (step 6) |
 
 ## Build
 

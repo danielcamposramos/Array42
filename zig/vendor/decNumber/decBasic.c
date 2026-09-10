@@ -1188,31 +1188,31 @@ decFloat * decFloatAdd(decFloat *result,
       // the fastpath test earlier
 
       // construct the result; low word is the same for both formats
-      encode =BIN2DPD[tac[0]];
-      encode|=BIN2DPD[tac[1]]<<10;
-      encode|=BIN2DPD[tac[2]]<<20;
-      encode|=BIN2DPD[tac[3]]<<30;
+      encode =(uInt)BIN2DPD[tac[0]];
+      encode|=(uInt)BIN2DPD[tac[1]]<<10;
+      encode|=(uInt)BIN2DPD[tac[2]]<<20;
+      encode|=(uInt)BIN2DPD[tac[3]]<<30;
       DFWORD(result, (DECBYTES/4)-1)=encode;
 
       // collect next two declets (all that remains, for Double)
-      encode =BIN2DPD[tac[3]]>>2;
-      encode|=BIN2DPD[tac[4]]<<8;
+      encode =(uInt)BIN2DPD[tac[3]]>>2;
+      encode|=(uInt)BIN2DPD[tac[4]]<<8;
 
       #if QUAD
       // complete and lay out middling words
-      encode|=BIN2DPD[tac[5]]<<18;
-      encode|=BIN2DPD[tac[6]]<<28;
+      encode|=(uInt)BIN2DPD[tac[5]]<<18;
+      encode|=(uInt)BIN2DPD[tac[6]]<<28;
       DFWORD(result, 2)=encode;
 
-      encode =BIN2DPD[tac[6]]>>4;
-      encode|=BIN2DPD[tac[7]]<<6;
-      encode|=BIN2DPD[tac[8]]<<16;
-      encode|=BIN2DPD[tac[9]]<<26;
+      encode =(uInt)BIN2DPD[tac[6]]>>4;
+      encode|=(uInt)BIN2DPD[tac[7]]<<6;
+      encode|=(uInt)BIN2DPD[tac[8]]<<16;
+      encode|=(uInt)BIN2DPD[tac[9]]<<26;
       DFWORD(result, 1)=encode;
 
       // and final two declets
-      encode =BIN2DPD[tac[9]]>>6;
-      encode|=BIN2DPD[tac[10]]<<4;
+      encode =(uInt)BIN2DPD[tac[9]]>>6;
+      encode|=(uInt)BIN2DPD[tac[10]]<<4;
       #endif
 
       // add exponent continuation and sign (from either argument)

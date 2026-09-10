@@ -7,4 +7,5 @@ comptime {
     _ = @import("helpers.zig");
     _ = @import("display.zig");
     _ = @import("commands1.zig");
+    _ = @import("commands2.zig");
 }
