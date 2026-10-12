@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use this work, please cite it as below."
+type: software
+title: "Array42: a native Zig port of Free42 with array types, as an MCP server"
+abstract: "Array42 is a native Zig port of Free42, Thomas Okken's HP-42S simulator, with array types in the style of DB48X, exposed as an MCP server and a Claude Code skill. Free42 is (C) 2004-2024 Thomas Okken; CREDITS lists everyone Free42 credits."
+authors:
+  - family-names: "Ramos"
+    given-names: "Daniel Campos"
+    orcid: "https://orcid.org/0009-0001-4546-8673"
+license: GPL-2.0-only
+repository-code: "https://github.com/danielcamposramos/Array42"
+keywords:
+  - "HP-42S"
+  - "Free42"
+  - "RPN calculator"
+  - "Zig"
+  - "MCP"
+  - "arrays"
+  - "DB48X"

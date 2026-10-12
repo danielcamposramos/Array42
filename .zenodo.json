@@ -1,0 +1,39 @@
+{
+  "title": "Array42: a native Zig port of Free42 with array types, as an MCP server",
+  "description": "Array42 is a native Zig port of Free42, Thomas Okken's HP-42S simulator, with array types in the style of DB48X, exposed as an MCP server and a Claude Code skill. Free42 is (C) 2004-2024 Thomas Okken; CREDITS lists everyone Free42 credits.",
+  "creators": [
+    {
+      "name": "Ramos, Daniel Campos",
+      "orcid": "0009-0001-4546-8673"
+    }
+  ],
+  "contributors": [
+    {
+      "name": "Okken, Thomas",
+      "type": "RightsHolder"
+    },
+    {
+      "name": "Wild, Allen",
+      "type": "Other"
+    }
+  ],
+  "license": "gpl-2.0-only",
+  "upload_type": "software",
+  "access_right": "open",
+  "keywords": [
+    "HP-42S",
+    "Free42",
+    "RPN calculator",
+    "Zig",
+    "MCP",
+    "arrays",
+    "DB48X"
+  ],
+  "related_identifiers": [
+    {
+      "identifier": "https://thomasokken.com/free42/",
+      "relation": "isDerivedFrom",
+      "scheme": "url"
+    }
+  ]
+}
