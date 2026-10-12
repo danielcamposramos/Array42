@@ -8,6 +8,7 @@ authors:
     given-names: "Daniel Campos"
     orcid: "https://orcid.org/0009-0001-4546-8673"
 license: GPL-2.0-only
+doi: "10.5281/zenodo.23308998"
 repository-code: "https://github.com/danielcamposramos/Array42"
 keywords:
   - "HP-42S"
